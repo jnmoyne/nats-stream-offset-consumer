@@ -5,7 +5,7 @@ namespace Synadia.OffsetConsumer;
 
 public interface IOffsetConsumer : IAsyncDisposable
 {
-    IAsyncEnumerable<NatsJSMsg<byte[]>> ConsumeAsync(CancellationToken cancellationToken = default);
+    IAsyncEnumerable<INatsJSMsg<byte[]>> ConsumeAsync(CancellationToken cancellationToken = default);
     Task CommitSyncAsync(CancellationToken cancellationToken = default);
     Task CommitAsync(CancellationToken cancellationToken = default);
     Task SeekAsync(ulong seq, CancellationToken cancellationToken = default);

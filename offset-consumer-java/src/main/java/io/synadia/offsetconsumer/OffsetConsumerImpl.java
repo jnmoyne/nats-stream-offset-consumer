@@ -97,22 +97,21 @@ class OffsetConsumerImpl implements OffsetConsumer {
      * Must be called while holding the lock.
      */
     private void startConsuming(MessageHandler handler) throws IOException, JetStreamApiException {
-        OrderedConsumerConfiguration.Builder occBuilder = new OrderedConsumerConfiguration.Builder();
+        OrderedConsumerConfiguration occ = new OrderedConsumerConfiguration();
 
         if (startSeq > 0) {
-            occBuilder.deliverPolicy(DeliverPolicy.ByStartSequence);
-            occBuilder.startSequence(startSeq + 1);
+            occ.deliverPolicy(DeliverPolicy.ByStartSequence);
+            occ.startSequence(startSeq + 1);
         } else if (config.getStartPosition() == StartPosition.END) {
-            occBuilder.deliverPolicy(DeliverPolicy.New);
+            occ.deliverPolicy(DeliverPolicy.New);
         } else {
-            occBuilder.deliverPolicy(DeliverPolicy.All);
+            occ.deliverPolicy(DeliverPolicy.All);
         }
 
         if (config.getFilterSubjects() != null && !config.getFilterSubjects().isEmpty()) {
-            occBuilder.filterSubjects(config.getFilterSubjects().toArray(new String[0]));
+            occ.filterSubjects(config.getFilterSubjects().toArray(new String[0]));
         }
 
-        OrderedConsumerConfiguration occ = occBuilder.build();
         io.nats.client.OrderedConsumerContext orderedConsumer = streamContext.createOrderedConsumer(occ);
 
         messageConsumer = orderedConsumer.consume(msg -> {

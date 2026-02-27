@@ -44,6 +44,9 @@ export async function casUpdate(
   revision: number,
 ): Promise<number> {
   try {
+    if (revision === 0) {
+      return await kv.create(key, value);
+    }
     return await kv.update(key, value, revision);
   } catch (err) {
     throw new CASConflictError(err instanceof Error ? err : undefined);

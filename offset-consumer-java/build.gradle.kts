@@ -18,6 +18,7 @@ dependencies {
     api("io.nats:jnats:2.25.1")
 
     testImplementation("org.junit.jupiter:junit-jupiter:5.11.4")
+    testImplementation("io.nats:jnats-server-runner:1.2.8")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 }
 

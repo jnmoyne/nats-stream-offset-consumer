@@ -101,8 +101,8 @@ public sealed class OffsetConsumer : IOffsetConsumer
             replicas = 1;
         }
 
-        // Create KV context from the JS context's underlying connection
-        var kvCtx = new NatsKVContext(js.Connection);
+        // Create KV context from the JS context
+        var kvCtx = new NatsKVContext(js);
 
         // Ensure the offset-consumers KV bucket exists
         var store = await EnsureBucketAsync(kvCtx, replicas, cancellationToken);
@@ -132,6 +132,10 @@ public sealed class OffsetConsumer : IOffsetConsumer
         {
             // No stored offset — use configured start position
         }
+        catch (NatsKVKeyDeletedException)
+        {
+            // Key was deleted — treat as no stored offset
+        }
 
         var consumer = new OffsetConsumer(js, store, config, kvKey, lastRevision, startSeq, lastCommittedSeq);
 
@@ -145,7 +149,7 @@ public sealed class OffsetConsumer : IOffsetConsumer
     }
 
     /// <inheritdoc />
-    public async IAsyncEnumerable<NatsJSMsg<byte[]>> ConsumeAsync(
+    public async IAsyncEnumerable<INatsJSMsg<byte[]>> ConsumeAsync(
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         await _lock.WaitAsync(cancellationToken);
@@ -479,7 +483,7 @@ public sealed class OffsetConsumer : IOffsetConsumer
         {
             opts = opts with
             {
-                FilterSubjects = _config.FilterSubjects.ToList(),
+                FilterSubjects = _config.FilterSubjects.ToArray(),
             };
         }
 
@@ -532,11 +536,11 @@ public sealed class OffsetConsumer : IOffsetConsumer
         {
             if (lastRevision == 0)
             {
-                return await _store.CreateAsync(_kvKey, value, cancellationToken);
+                return await _store.CreateAsync(_kvKey, value, cancellationToken: cancellationToken);
             }
             else
             {
-                return await _store.UpdateAsync(_kvKey, value, lastRevision, cancellationToken);
+                return await _store.UpdateAsync(_kvKey, value, lastRevision, cancellationToken: cancellationToken);
             }
         }
         catch (NatsKVWrongLastRevisionException ex)
