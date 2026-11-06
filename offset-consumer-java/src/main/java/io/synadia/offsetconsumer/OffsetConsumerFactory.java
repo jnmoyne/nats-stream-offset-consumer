@@ -2,22 +2,24 @@ package io.synadia.offsetconsumer;
 
 import io.nats.client.Connection;
 import io.nats.client.JetStreamApiException;
+import io.nats.client.JetStreamManagement;
 import io.nats.client.KeyValue;
-import io.nats.client.KeyValueManagement;
 import io.nats.client.NUID;
 import io.nats.client.StreamContext;
 import io.nats.client.api.KeyValueConfiguration;
 import io.nats.client.api.KeyValueEntry;
+import io.nats.client.api.StreamConfiguration;
 import io.nats.client.api.StreamInfo;
 
 import java.io.IOException;
 import java.net.InetAddress;
 import java.time.Duration;
 import java.time.Instant;
-import java.time.format.DateTimeParseException;
+import java.time.ZonedDateTime;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.regex.Pattern;
 
 /**
  * Factory for creating OffsetConsumer instances.
@@ -25,15 +27,18 @@ import java.util.Map;
 public final class OffsetConsumerFactory {
 
     static final String KV_BUCKET_NAME = "offset-consumers";
+    static final String KV_STREAM_NAME = "KV_" + KV_BUCKET_NAME;
 
     /**
-     * Grace window during which a fresh ownership claim is considered alive
-     * even if its ordered consumer cannot be found on the server yet. jnats
-     * does not let the ordered consumer's inactive threshold be configured, so
-     * the server default for ephemeral consumers (5 seconds) applies, and the
-     * same value is used here.
+     * Upper bound for {@code stream.length() + consumerName.length()}. Ordered
+     * consumer names are "oc-{stream}-{consumer}-{22-char nuid}-g{gen}" plus a
+     * client suffix, and the server limits names to 255 characters; 32
+     * characters are reserved for the generation and client suffixes.
      */
-    static final Duration CLAIM_GRACE = Duration.ofSeconds(5);
+    static final int MAX_COMBINED_NAME_LENGTH = 255 - 32 - "oc-".length() - 2 - 22;
+
+    /** Names usable both in a KV key token and in a consumer name. */
+    private static final Pattern VALID_NAME = Pattern.compile("^[A-Za-z0-9_=-]+$");
 
     /** Delete-marker TTL applied when the library creates the bucket. */
     static final Duration DELETE_MARKER_TTL = Duration.ofMinutes(10);
@@ -49,15 +54,23 @@ public final class OffsetConsumerFactory {
 
     /**
      * Creates a new offset consumer for the given stream and consumer name.
-     * Ensures the offset-consumers KV bucket exists, reads any stored offset,
-     * resolves the start sequence and claims ownership of the offset entry.
+     * Ensures the offset-consumers KV bucket exists and checks the stored offset
+     * entry; it writes nothing and creates nothing on the server. If the entry's
+     * owner is visibly alive (a consumer whose name starts with its owner prefix
+     * exists on the stream; checked once, without waiting), an
+     * {@link AlreadyInUseException} is thrown. Ownership is claimed when
+     * consumption starts (see {@link OffsetConsumer#consume}).
+     * {@link StartPosition#END} is resolved to the stream's last sequence here;
+     * the claim stores it if there is no usable stored offset by then.
      * Does NOT start consuming — call consume() for that.
      *
      * @param nc     NATS connection (must have JetStream capability)
      * @param config consumer configuration
      * @return a new OffsetConsumer instance
-     * @throws IllegalArgumentException if consumerName is empty or contains '.'
-     * @throws AlreadyInUseException    if another live instance owns the offset entry
+     * @throws IllegalArgumentException if the stream or consumer name is invalid: names may only
+     *                                  contain letters, digits, '-', '_' and '=', and together
+     *                                  must not exceed {@value #MAX_COMBINED_NAME_LENGTH} characters
+     * @throws AlreadyInUseException    if another live instance visibly owns the offset entry
      * @throws IOException              if the target stream does not exist or KV operations fail
      * @throws JetStreamApiException    if JetStream API calls fail
      */
@@ -65,76 +78,107 @@ public final class OffsetConsumerFactory {
             throws IOException, JetStreamApiException, AlreadyInUseException {
 
         String consumerName = config.getConsumerName();
-        if (consumerName == null || consumerName.isEmpty()) {
-            throw new IllegalArgumentException("consumerName must not be null or empty");
-        }
-        if (consumerName.contains(".")) {
-            throw new IllegalArgumentException("consumerName must not contain '.'");
-        }
+        validateNames(config.getStream(), consumerName);
 
         StreamContext streamContext = nc.getStreamContext(config.getStream());
 
         StreamInfo streamInfo = streamContext.getStreamInfo();
         int replicas = streamInfo.getConfiguration().getReplicas();
         KeyValue kv = ensureBucket(nc, replicas);
+        String streamCreated = streamCreatedId(streamInfo.getCreateTime());
+        long lastSeq = streamInfo.getStreamState().getLastSequence();
 
         String kvKey = config.getStream() + "." + consumerName;
         String owner = "oc-" + config.getStream() + "-" + consumerName + "-" + NUID.nextGlobal();
         String host = hostname();
 
-        // Read the stored entry and check that nobody else owns it.
+        // Resolve StartPosition now (not when consumption starts): the claim
+        // stores it if there is no usable stored offset by then.
+        long initialSeq = 0;
+        String initialAt = "";
+        if (config.getStartPosition() == StartPosition.END && lastSeq > 0) {
+            initialSeq = lastSeq;
+            initialAt = Instant.now().toString();
+        }
+
+        // Fail fast if the entry is visibly owned. This check does not wait:
+        // the full check runs when consumption starts.
         KeyValueEntry kve = kv.get(kvKey);
-        OffsetEntry stored = kve == null ? OffsetEntry.empty() : OffsetEntry.fromJson(kve.getValue());
-        long revision = kve == null ? 0 : kve.getRevision();
-        if (!stored.getOwner().isEmpty()) {
-            checkOwnership(streamContext, stored);
+        if (kve != null) {
+            OffsetEntry stored = OffsetEntry.fromJson(kve.getValue());
+            if (!stored.getOwner().isEmpty() && isOwnerAlive(streamContext, stored.getOwner())) {
+                throw new AlreadyInUseException(stored.getOwner(), stored.getHost());
+            }
         }
 
-        // Claim ownership with a single CAS write that keeps the stored offset.
-        OffsetEntry claim = new OffsetEntry(stored.getSeq(), stored.getCommittedAt(),
-                owner, host, Instant.now().toString());
-        try {
-            if (revision == 0) {
-                kv.create(kvKey, claim.toJson());
-            } else {
-                kv.update(kvKey, claim.toJson(), revision);
-            }
-        } catch (JetStreamApiException e) {
-            if (e.getApiErrorCode() == JS_WRONG_LAST_SEQUENCE || e.getApiErrorCode() == JS_WRONG_LAST_SEQUENCE_CONSTANT) {
-                OffsetEntry current = stored;
-                KeyValueEntry now = kv.get(kvKey);
-                if (now != null) {
-                    current = OffsetEntry.fromJson(now.getValue());
-                }
-                throw new AlreadyInUseException(current.getOwner(), current.getHost(), current.getClaimedAt());
-            }
-            throw e;
-        }
-
-        return new OffsetConsumerImpl(config, streamContext, kv, kvKey, claim);
+        return new OffsetConsumerImpl(config, streamContext, kv, kvKey, owner, host, streamCreated,
+                initialSeq, initialAt);
     }
 
     /**
-     * Throws AlreadyInUseException if the entry's owner is still alive: either
-     * its claim is younger than the grace window, or a consumer with its
-     * prefix still exists on the stream.
+     * Reports whether a KV create/update failed because the entry's revision
+     * changed (a compare-and-set conflict).
      */
-    private static void checkOwnership(StreamContext streamContext, OffsetEntry stored)
-            throws IOException, JetStreamApiException, AlreadyInUseException {
-        AlreadyInUseException inUse = new AlreadyInUseException(stored.getOwner(), stored.getHost(), stored.getClaimedAt());
-        try {
-            Instant claimed = Instant.parse(stored.getClaimedAt());
-            if (Duration.between(claimed, Instant.now()).compareTo(CLAIM_GRACE) < 0) {
-                throw inUse;
-            }
-        } catch (DateTimeParseException ignored) {
-            // unparsable claim time: rely on the liveness check
+    static boolean isRevisionConflict(JetStreamApiException e) {
+        return e.getApiErrorCode() == JS_WRONG_LAST_SEQUENCE || e.getApiErrorCode() == JS_WRONG_LAST_SEQUENCE_CONSTANT;
+    }
+
+    /**
+     * Checks the stream and consumer names: letters, digits, '-', '_' and '='
+     * only (they are used in a KV key token and in consumer names), and
+     * together at most {@link #MAX_COMBINED_NAME_LENGTH} characters.
+     */
+    static void validateNames(String stream, String consumerName) {
+        if (consumerName == null || !VALID_NAME.matcher(consumerName).matches()) {
+            throw new IllegalArgumentException("Invalid consumer name \"" + consumerName
+                    + "\": use letters, digits, '-', '_' and '=' only");
         }
+        if (stream == null || !VALID_NAME.matcher(stream).matches()) {
+            throw new IllegalArgumentException("Invalid stream name \"" + stream
+                    + "\": use letters, digits, '-', '_' and '=' only");
+        }
+        if (stream.length() + consumerName.length() > MAX_COMBINED_NAME_LENGTH) {
+            throw new IllegalArgumentException("Invalid consumer name \"" + consumerName
+                    + "\": stream and consumer names together exceed " + MAX_COMBINED_NAME_LENGTH + " characters");
+        }
+    }
+
+    /**
+     * Identifies a stream incarnation by its creation time, as decimal Unix
+     * nanoseconds (the same string in every port). Empty when unknown.
+     */
+    static String streamCreatedId(ZonedDateTime created) {
+        if (created == null || created.getYear() <= 1) {
+            return "";
+        }
+        Instant i = created.toInstant();
+        return Long.toString(Math.addExact(Math.multiplyExact(i.getEpochSecond(), 1_000_000_000L), i.getNano()));
+    }
+
+    /**
+     * Reports whether a stored entry refers to an earlier incarnation of the
+     * stream. Entries from older versions carry no stream identity; for those
+     * a stored sequence beyond the stream's last sequence is the tell-tale sign.
+     */
+    static boolean streamWasRecreated(OffsetEntry entry, String currentCreated, long lastSeq) {
+        if (!entry.getStreamCreated().isEmpty() && !currentCreated.isEmpty()) {
+            return !entry.getStreamCreated().equals(currentCreated);
+        }
+        return entry.getSeq() > lastSeq;
+    }
+
+    /**
+     * Reports whether a consumer whose name starts with the owner prefix
+     * exists on the stream (the owner's ordered consumer).
+     */
+    static boolean isOwnerAlive(StreamContext streamContext, String owner)
+            throws IOException, JetStreamApiException {
         for (String name : streamContext.getConsumerNames()) {
-            if (name.startsWith(stored.getOwner())) {
-                throw inUse;
+            if (name.startsWith(owner)) {
+                return true;
             }
         }
+        return false;
     }
 
     static String hostname() {
@@ -158,7 +202,15 @@ public final class OffsetConsumerFactory {
     public static Map<String, OffsetConsumerInfo> listConsumers(Connection nc, String stream)
             throws IOException, JetStreamApiException {
         Map<String, OffsetConsumerInfo> result = new HashMap<>();
-        KeyValue kv = nc.keyValue(KV_BUCKET_NAME);
+        KeyValue kv;
+        try {
+            kv = nc.keyValue(KV_BUCKET_NAME);
+        } catch (IOException e) {
+            if (isStreamNotFound(e)) {
+                return result; // bucket does not exist: no consumers
+            }
+            throw e;
+        }
 
         String prefix = stream + ".";
         List<String> keys;
@@ -185,27 +237,65 @@ public final class OffsetConsumerFactory {
     }
 
     /**
-     * Ensures the offset-consumers KV bucket exists with the correct configuration:
-     * replicas matching the stream (minimum 1), history 1, and a 10-minute
-     * delete-marker TTL so tombstones left by deleteConsumer() are purged.
+     * Returns the offset-consumers KV bucket, creating it if it does not exist
+     * with replicas matching the stream (minimum 1), history 1, and a 10-minute
+     * delete-marker TTL so tombstones left by deleteConsumer() are purged. An
+     * existing bucket's configuration is never overwritten; its replica count
+     * is only ever raised (best effort) so that offsets of a replicated stream
+     * are not stored with fewer replicas than the stream itself.
      */
     private static KeyValue ensureBucket(Connection nc, int replicas)
             throws IOException, JetStreamApiException {
-        KeyValueConfiguration kvConfig = KeyValueConfiguration.builder()
-                .name(KV_BUCKET_NAME)
-                .replicas(Math.max(replicas, 1))
-                .maxHistoryPerKey(1)
-                .limitMarker(DELETE_MARKER_TTL)
-                .build();
-
-        KeyValueManagement kvMgmt = nc.keyValueManagement();
+        int wanted = Math.max(replicas, 1);
+        KeyValue kv;
         try {
-            kvMgmt.create(kvConfig);
-        } catch (JetStreamApiException e) {
-            if (e.getApiErrorCode() != JS_STREAM_NAME_IN_USE) {
+            kv = nc.keyValue(KV_BUCKET_NAME);
+        } catch (IOException e) {
+            if (!isStreamNotFound(e)) {
                 throw e;
             }
+            KeyValueConfiguration kvConfig = KeyValueConfiguration.builder()
+                    .name(KV_BUCKET_NAME)
+                    .replicas(wanted)
+                    .maxHistoryPerKey(1)
+                    .limitMarker(DELETE_MARKER_TTL)
+                    .build();
+            try {
+                nc.keyValueManagement().create(kvConfig);
+            } catch (JetStreamApiException ce) {
+                if (ce.getApiErrorCode() != JS_STREAM_NAME_IN_USE) {
+                    throw ce;
+                }
+                // created concurrently, possibly with another configuration
+            }
+            kv = nc.keyValue(KV_BUCKET_NAME);
         }
-        return nc.keyValue(KV_BUCKET_NAME);
+        raiseBucketReplicas(nc, wanted);
+        return kv;
+    }
+
+    /**
+     * Raises the bucket's replica count to replicas if it is lower. Errors
+     * (permissions, too few servers) are ignored: the bucket keeps working with
+     * its current replicas.
+     */
+    private static void raiseBucketReplicas(Connection nc, int replicas) {
+        try {
+            JetStreamManagement jsm = nc.jetStreamManagement();
+            StreamConfiguration sc = jsm.getStreamInfo(KV_STREAM_NAME).getConfiguration();
+            if (sc.getReplicas() >= replicas) {
+                return;
+            }
+            jsm.updateStream(StreamConfiguration.builder(sc).replicas(replicas).build());
+        } catch (Exception ignored) {
+            // best effort
+        }
+    }
+
+    /** jnats reports a missing bucket as an IOException wrapping a "stream not found" API error. */
+    private static boolean isStreamNotFound(IOException e) {
+        Throwable cause = e.getCause();
+        return cause instanceof JetStreamApiException
+                && ((JetStreamApiException) cause).getApiErrorCode() == JS_STREAM_NOT_FOUND;
     }
 }

@@ -15,66 +15,111 @@ Per-language API contracts: [`specs/001-offset-consumer/contracts/`](specs/001-o
 ## How it works
 
 - **Transport**: a JetStream ephemeral ordered consumer created at
-  `stored_seq + 1` (or at the beginning/end of the stream for a new consumer).
+  `stored_seq + 1`. A new consumer starts at the beginning of the stream, or at
+  the end; the end position is resolved and stored when the consumer is
+  created, so a restart never skips messages published while it was down.
 - **Offset store**: one KV bucket shared by all streams and consumers, keyed
   `{stream}.{consumer}`, created on first use with the stream's replica count,
-  history 1 and a 10-minute delete-marker TTL. The value is JSON:
+  history 1 and a 10-minute delete-marker TTL. An existing bucket is never
+  reconfigured, except that its replica count is raised (never lowered) to
+  match a more replicated stream. The value is JSON:
 
   ```json
   {"seq": 104872, "committed_at": "2026-02-25T10:45:00Z",
-   "owner": "oc-orders-billing-<nuid>", "host": "node-7", "claimed_at": "2026-02-25T10:40:00Z"}
+   "owner": "oc-orders-billing-<nuid>", "host": "node-7",
+   "stream_created": "1772016000123456789"}
   ```
 
+  `stream_created` identifies the stream incarnation the offset belongs to.
+- **Names**: stream and consumer names may only contain letters, digits, `-`,
+  `_` and `=`, and together at most 196 characters.
 - **Commits** (`CommitSync` / `CommitAsync`) write the sequence of the last
-  message delivered to the handler. Async commits never block on the server;
+  message delivered to the handler, so a commit from inside the handler
+  includes the current message. Async commits never block on the server;
   several may be pending and they are applied in call order. Writes are plain
   KV puts (last writer wins); there is no per-commit compare-and-set.
-- **Auto-commit** runs a timer that commits only when new messages were
-  delivered; failures go to the configured error handler.
+- **Auto-commit** runs a timer that commits the last message whose handler
+  has **returned**, never one still being processed; failures go to the
+  configured error handler, which may call `Close`.
 - **Seek** stops delivery, deletes the ordered consumer, writes the new
   position and restarts delivery under a new ordered consumer. In JS the
   iterable returned by `consume()` keeps yielding across the restart.
 - **Close** waits up to 5s for pending async commits, deletes the ordered
   consumer, and writes the entry once more with ownership cleared. That write
   persists the highest sequence passed to a commit call, so commits still
-  queued after the wait are abandoned without losing the position.
+  queued after the wait are abandoned without losing the position. With
+  auto-commit it also covers the processed messages; a message still in its
+  handler is redelivered on the next start.
+- **Consume, Seek and Close are serialized** per instance, so concurrent calls
+  never leave two ordered consumers running.
+- **Stream recreation is detected.** When a stream is deleted and recreated,
+  its sequence numbers restart at 1, but the client silently recreates the
+  ordered consumer at the old position, skipping the new stream's messages or
+  waiting forever. The library compares the stream's creation time with the
+  one stored in the entry, at startup and after any ordered-consumer reset. On
+  a mismatch it resets to the configured start position, like Kafka's
+  `auto.offset.reset`, and reports a "stream recreated" error to the error
+  handler.
 - **Delivery is at-least-once**: handlers must be idempotent.
 
 ## Single active consumer: ownership claim
 
 Only one instance of a given `{stream}.{consumer}` may run at a time. The
-library enforces this at startup, using the server's own liveness tracking
-instead of per-commit CAS:
+library enforces this when consumption starts, using the server's own
+liveness tracking instead of per-commit CAS. An owner counts as alive while it
+has a consumer on the server, and the library keeps that true for an owner's
+whole life:
 
-1. Every instance generates an **owner prefix** `oc-{stream}-{consumer}-{nuid}`
-   and creates its ordered consumers with names starting with that prefix
-   (`{owner}-g{generation}` plus a client-specific suffix; the generation
-   increments on every restart, for example after a seek).
-2. On startup the instance reads the KV entry. If it carries an owner, the
-   instance refuses to start (`AlreadyInUse` error, naming the owner, its host
-   and claim time) when either the claim is younger than the inactive
-   threshold, or the stream still has a consumer whose name starts with that
-   owner prefix.
-3. Otherwise it **claims** the entry with a single compare-and-set write
-   (create when absent, update-by-revision otherwise), keeping the stored
-   offset and setting `owner`, `host` and `claimed_at`. Losing that race is
-   reported as `AlreadyInUse` too.
-4. Every commit carries the ownership fields unchanged. `Close` deletes the
+1. Every instance generates an **owner prefix** `oc-{stream}-{consumer}-{nuid}`.
+   Its ordered consumers are named `{owner}-g{generation}` plus a
+   client-specific suffix. The generation increments on every restart, for
+   example after a seek.
+2. Construction reads the KV entry and refuses with an `AlreadyInUse` error
+   (naming the owner and its host) if the stored owner has a consumer whose
+   name starts with its prefix. It writes nothing.
+3. `Consume` **claims** the entry, then immediately creates the ordered
+   consumer:
+   - if the stored owner is another instance with a consumer, it refuses with
+     `AlreadyInUse`;
+   - if that owner has no consumer, it waits 5 seconds (measured locally) and
+     looks again, which rides out an ordered consumer being recreated by its
+     client;
+   - the claim is a compare-and-set write against the entry as read before the
+     wait, so a commit by the owner, or another instance's claim, during the
+     wait makes it fail with `AlreadyInUse`.
+4. A seek creates the new ordered consumer before deleting the old one, so the
+   owner never disappears from the server. A seek before `Consume` only
+   records the position, and the claim stores it.
+5. Every commit carries the ownership fields unchanged. `Close` deletes the
    ordered consumer and writes the entry back with an empty owner (and the
-   final commit, when auto-commit is on), so a restart is allowed immediately.
-5. If the instance crashes, the server deletes its ephemeral ordered consumer
-   after the **inactive threshold**, and the next instance is allowed in.
+   final commit, when auto-commit is on), so a restart is allowed
+   immediately. That release write is a compare-and-set on an entry that
+   still names the instance: if another instance claimed the entry meanwhile,
+   `Close` leaves it alone and returns `AlreadyInUse`; if the entry was
+   deleted, nothing is written.
+6. If the instance crashes, the server deletes its ordered consumer after the
+   **inactive threshold**, and the next instance is allowed in one 5 second
+   wait later.
+
+No clocks are compared across hosts: there is no claim timestamp, and the
+only time measured is the local 5 second wait.
 
 What is deliberately **not** covered:
 
 - A running instance does not detect that it was displaced (for example after
   being partitioned long enough for its consumer to expire). Its later commits
-  overwrite the newcomer's. Detecting this needs a KV watch; it is not implemented.
+  overwrite the newcomer's; only its `Close` is guarded, by the conditional
+  release. Comparing the entry's owner on every ordered-consumer reset is not
+  enough on its own: commits buffered by the client during the disconnect are
+  flushed on reconnect and can write the old owner back over the newcomer's.
 - There is no forced takeover. An operator who must evict a live owner has to
   stop it; deleting its ordered consumer is not enough, the client recreates it.
-- During an ordered-consumer reset there is a window of a few milliseconds in
-  which the old consumer is gone and the new one not yet created; a starter
-  landing exactly then is not refused.
+- An owner with no consumer looks dead after the wait and can be taken over:
+  after a failed seek, or once a Rust delivery loop has ended. Its next
+  `Consume` claims again and is refused.
+- An ordered consumer lost with its server (R1, in memory) while the client
+  stays connected is missing until the client notices the missed heartbeats,
+  which can take longer than the 5 second wait.
 
 ### Inactive threshold per language
 
@@ -85,9 +130,7 @@ What is deliberately **not** covered:
 | Java | 5s, not configurable | jnats exposes no inactive threshold for ordered consumers; the server default for ephemeral consumers applies |
 | Rust | 30s, not configurable | async-nats hard-codes it in `OrderedConfig` |
 
-The same value is the grace window during which a fresh claim counts as alive
-even if its ordered consumer cannot be found yet. Call `Consume` promptly after
-constructing a consumer.
+It sets how long a crashed instance keeps the entry (plus the 5 second wait).
 
 ## Ports
 
@@ -103,13 +146,28 @@ ownership fields) and a standalone `ListConsumers(stream)`.
 
 ### Per-language caveats
 
-- **Java**: the ordered consumer expires 5s after the connection drops, so
+- **Go**: async commits go through a JetStream context of the library's own,
+  with a 5s publish ack timeout, so a lost acknowledgement fails the commit
+  instead of leaving it pending forever.
+- **Java**: jnats does not report ordered-consumer resets, so the library
+  checks every second whether the ordered consumer's name changed. jnats only
+  recreates a deleted consumer after three missed heartbeats, so the port pulls
+  with a 5s expiry (2.5s heartbeat): a recreated stream is noticed within about
+  15s instead of 90s, at the cost of one idle pull request every 5s. The ordered
+  consumer expires 5s after the connection drops, so
   crash recovery is fast, but a long GC pause or network blip can make the
   client recreate the consumer under a new name (old one never deleted, it
   expires on its own). Harmless for ownership checks, which match on prefix.
 - **JS/TS**: see the threshold note above. `ConsumerMessages.stop()` also
   deletes the ordered consumer.
-- **Rust**: if the ordered consumer resets before the first message was
+- **Rust**: the handler is a synchronous closure called from a Tokio task. A
+  handler that blocks must use `tokio::task::block_in_place` on a
+  multi-threaded runtime (or hand work to `spawn_blocking`), otherwise it
+  stalls the runtime worker it runs on. async-nats exposes no ordered-consumer reset signal, so stream
+  recreation is detected by polling the stream info every 5s while consuming.
+  Errors yielded by the ordered stream are reported to the error handler and
+  consumption continues, with a backoff; only the end of the stream stops it,
+  and that is reported too. If the ordered consumer resets before the first message was
   delivered, async-nats 0.51 restarts it with `DeliverPolicy::All` instead of
   the requested start sequence. Under at-least-once semantics this only causes
   redelivery, but it can be a lot of it. The crash-recovery test takes ~35s

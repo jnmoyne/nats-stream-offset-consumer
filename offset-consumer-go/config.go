@@ -19,7 +19,9 @@ type ConsumerConfig struct {
 	Stream string
 
 	// ConsumerName is the logical name for this consumer. Required.
-	// Must not be empty. Must not contain '.'.
+	// Letters, digits, '-', '_' and '=' only; the stream and consumer names
+	// together must not exceed 196 characters (the server limits consumer
+	// names to 255, and the ordered consumer names embed both).
 	// Together with Stream forms the KV key: "{Stream}.{ConsumerName}".
 	ConsumerName string
 
@@ -39,15 +41,18 @@ type ConsumerConfig struct {
 	ErrorHandler func(OffsetConsumer, error)
 
 	// StartPosition controls where a new consumer (no stored offset) begins.
-	// Default: StartPositionBeginning (sequence 1).
+	// Default: StartPositionBeginning (sequence 1). StartPositionEnd is
+	// resolved to the stream's last sequence when the consumer is created and
+	// that position is stored immediately, so messages published while the
+	// consumer is down are not skipped on the next start. It also applies
+	// when the stream is found to have been recreated (see ErrStreamRecreated).
 	StartPosition StartPosition
 
 	// InactiveThreshold is the server-side inactivity threshold of the
 	// underlying ephemeral ordered consumer. After an instance crashes, its
 	// ordered consumer (and with it the ownership of the offset entry) is
-	// released by the server once this threshold elapses. It is also the
-	// grace window during which a fresh ownership claim is considered alive
-	// even if its ordered consumer has not been created yet. Default: 30s.
+	// released by the server once this threshold elapses; the next instance
+	// is admitted a few seconds later (the liveness wait). Default: 30s.
 	InactiveThreshold time.Duration
 }
 

@@ -12,9 +12,13 @@ import java.nio.charset.StandardCharsets;
 /**
  * The record stored in the offset-consumers KV bucket.
  * <pre>
- * {"seq":123,"committed_at":"...","owner":"oc-...","host":"...","claimed_at":"..."}
+ * {"seq":123,"committed_at":"...","owner":"oc-...","host":"...","stream_created":"..."}
  * </pre>
- * An empty owner means the entry is not owned by any live instance.
+ * An empty owner means the entry is not owned by any live instance. Entries
+ * written by older versions may also carry {@code claimed_at}; it is ignored.
+ * {@code stream_created} identifies the stream incarnation the offset refers
+ * to (the stream's creation time in Unix nanoseconds, as a decimal string); it
+ * is omitted when unknown (entries written by older versions).
  */
 final class OffsetEntry {
 
@@ -22,14 +26,14 @@ final class OffsetEntry {
     private final String committedAt;
     private final String owner;
     private final String host;
-    private final String claimedAt;
+    private final String streamCreated;
 
-    OffsetEntry(long seq, String committedAt, String owner, String host, String claimedAt) {
+    OffsetEntry(long seq, String committedAt, String owner, String host, String streamCreated) {
         this.seq = seq;
         this.committedAt = committedAt == null ? "" : committedAt;
         this.owner = owner == null ? "" : owner;
         this.host = host == null ? "" : host;
-        this.claimedAt = claimedAt == null ? "" : claimedAt;
+        this.streamCreated = streamCreated == null ? "" : streamCreated;
     }
 
     static OffsetEntry empty() {
@@ -52,12 +56,12 @@ final class OffsetEntry {
         return host;
     }
 
-    String getClaimedAt() {
-        return claimedAt;
+    String getStreamCreated() {
+        return streamCreated;
     }
 
     OffsetConsumerInfo toInfo() {
-        return new OffsetConsumerInfo(seq, committedAt, owner, host, claimedAt);
+        return new OffsetConsumerInfo(seq, committedAt, owner, host, streamCreated);
     }
 
     byte[] toJson() {
@@ -66,7 +70,9 @@ final class OffsetEntry {
         appendString(sb, "committed_at", committedAt);
         appendString(sb, "owner", owner);
         appendString(sb, "host", host);
-        appendString(sb, "claimed_at", claimedAt);
+        if (!streamCreated.isEmpty()) {
+            appendString(sb, "stream_created", streamCreated);
+        }
         sb.append('}');
         return sb.toString().getBytes(StandardCharsets.UTF_8);
     }
@@ -85,7 +91,7 @@ final class OffsetEntry {
                     JsonValueUtils.readString(jv, "committed_at", ""),
                     JsonValueUtils.readString(jv, "owner", ""),
                     JsonValueUtils.readString(jv, "host", ""),
-                    JsonValueUtils.readString(jv, "claimed_at", ""));
+                    JsonValueUtils.readString(jv, "stream_created", ""));
         } catch (JsonParseException e) {
             throw new IOException("Failed to parse offset entry", e);
         }

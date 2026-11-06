@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,7 +17,50 @@ const (
 	kvBucketName       = "offset-consumers"
 	kvStreamNamePrefix = "KV_"
 	defaultAPIPrefix   = "$JS.API."
+
+	// maxCombinedNameLen bounds len(stream)+len(consumerName). Ordered
+	// consumer names are "oc-{stream}-{consumer}-{22-char nuid}-g{gen}" plus
+	// a client suffix, and the server limits names to 255 characters; 32
+	// characters are reserved for the generation and client suffixes.
+	maxCombinedNameLen = 255 - 32 - len("oc-") - 2 - 22
 )
+
+// validName matches names usable both in a KV key token and in a consumer name.
+var validName = regexp.MustCompile(`^[A-Za-z0-9_=-]+$`)
+
+// validateNames checks the stream and consumer names.
+func validateNames(stream, consumerName string) error {
+	if !validName.MatchString(consumerName) {
+		return fmt.Errorf("%w %q: use letters, digits, '-', '_' and '=' only", ErrInvalidConsumerName, consumerName)
+	}
+	if !validName.MatchString(stream) {
+		return fmt.Errorf("%w %q: use letters, digits, '-', '_' and '=' only", ErrInvalidStreamName, stream)
+	}
+	if len(stream)+len(consumerName) > maxCombinedNameLen {
+		return fmt.Errorf("%w %q: stream and consumer names together exceed %d characters", ErrInvalidConsumerName, consumerName, maxCombinedNameLen)
+	}
+	return nil
+}
+
+// streamCreatedID identifies a stream incarnation by its creation time, as
+// decimal Unix nanoseconds (the same string in every port).
+func streamCreatedID(created time.Time) string {
+	if created.IsZero() {
+		return ""
+	}
+	return strconv.FormatInt(created.UnixNano(), 10)
+}
+
+// streamWasRecreated reports whether a stored entry refers to an earlier
+// incarnation of the stream. Entries from older versions carry no stream
+// identity; for those a stored sequence beyond the stream's last sequence is
+// the tell-tale sign.
+func streamWasRecreated(entry offsetEntry, currentCreated string, lastSeq uint64) bool {
+	if entry.StreamCreated != "" && currentCreated != "" {
+		return entry.StreamCreated != currentCreated
+	}
+	return entry.Seq > lastSeq
+}
 
 // errClaimConflict is returned by claimEntry when the CAS write loses a race
 // against another instance claiming the same entry.
@@ -32,17 +77,18 @@ type offsetEntry struct {
 	Owner string `json:"owner"`
 	// Host is the hostname of the owning instance.
 	Host string `json:"host"`
-	// ClaimedAt is the RFC3339 time at which the owner claimed the entry.
-	ClaimedAt string `json:"claimed_at"`
+	// StreamCreated is the stream's creation time in Unix nanoseconds
+	// (decimal string): the stream incarnation Seq refers to.
+	StreamCreated string `json:"stream_created,omitempty"`
 }
 
 func (e offsetEntry) info() OffsetConsumerInfo {
 	return OffsetConsumerInfo{
-		Seq:         e.Seq,
-		CommittedAt: e.CommittedAt,
-		Owner:       e.Owner,
-		Host:        e.Host,
-		ClaimedAt:   e.ClaimedAt,
+		Seq:           e.Seq,
+		CommittedAt:   e.CommittedAt,
+		Owner:         e.Owner,
+		Host:          e.Host,
+		StreamCreated: e.StreamCreated,
 	}
 }
 
@@ -163,24 +209,52 @@ func kvPutSubject(ctx context.Context, js jetstream.JetStream, kv jetstream.KeyV
 	return b.String()
 }
 
-// ensureBucket creates the offset-consumers KV bucket if it does not exist,
-// or returns the existing one. The bucket is created with replicas matching
-// the target stream, history=1, and a 10-minute delete marker TTL.
+// ensureBucket returns the offset-consumers KV bucket, creating it if it
+// does not exist with replicas matching the target stream, history=1, and a
+// 10-minute delete marker TTL. An existing bucket's configuration is never
+// overwritten; its replica count is only ever raised (best effort) so that
+// offsets of a replicated stream are not stored with fewer replicas than the
+// stream itself.
 func ensureBucket(ctx context.Context, js jetstream.JetStream, replicas int) (jetstream.KeyValue, error) {
 	if replicas < 1 {
 		replicas = 1
 	}
 
-	kv, err := js.CreateOrUpdateKeyValue(ctx, jetstream.KeyValueConfig{
-		Bucket:         kvBucketName,
-		Replicas:       replicas,
-		History:        1,
-		LimitMarkerTTL: 10 * time.Minute,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("offset consumer: failed to ensure KV bucket: %w", err)
+	kv, err := js.KeyValue(ctx, kvBucketName)
+	if errors.Is(err, jetstream.ErrBucketNotFound) {
+		kv, err = js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
+			Bucket:         kvBucketName,
+			Replicas:       replicas,
+			History:        1,
+			LimitMarkerTTL: 10 * time.Minute,
+		})
+		if errors.Is(err, jetstream.ErrBucketExists) {
+			// Created concurrently, possibly with another configuration.
+			kv, err = js.KeyValue(ctx, kvBucketName)
+		}
 	}
+	if err != nil {
+		return nil, fmt.Errorf("offset consumer: failed to open KV bucket: %w", err)
+	}
+
+	raiseBucketReplicas(ctx, js, replicas)
 	return kv, nil
+}
+
+// raiseBucketReplicas raises the bucket's replica count to replicas if it is
+// lower. Errors (permissions, too few servers) are ignored: the bucket keeps
+// working with its current replicas.
+func raiseBucketReplicas(ctx context.Context, js jetstream.JetStream, replicas int) {
+	stream, err := js.Stream(ctx, kvStreamNamePrefix+kvBucketName)
+	if err != nil {
+		return
+	}
+	cfg := stream.CachedInfo().Config
+	if cfg.Replicas >= replicas {
+		return
+	}
+	cfg.Replicas = replicas
+	_, _ = js.UpdateStream(ctx, cfg)
 }
 
 // ListConsumers returns all offset consumers for the given stream by using

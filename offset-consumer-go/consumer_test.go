@@ -438,9 +438,9 @@ func TestAutoCommit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewConsumer (verify): %v", err)
 	}
-	impl := c2.(*offsetConsumer)
-	t.Logf("Stored offset after auto-commit: %d", impl.startSeq)
-	if impl.startSeq == 0 {
+	stored := storedSeq(t, c2)
+	t.Logf("Stored offset after auto-commit: %d", stored)
+	if stored == 0 {
 		t.Error("expected non-zero stored offset after auto-commit")
 	}
 	c2.Close()
@@ -547,7 +547,7 @@ func TestSeekRestartsWithNewGeneration(t *testing.T) {
 	waitUntil(5*time.Second, func() bool { return lastDelivered(c) >= numMessages })
 
 	impl := c.(*offsetConsumer)
-	before := consumerNamesWithPrefix(t, js, impl.owner)
+	before := consumerNamesWithPrefix(t, js, impl.owner+"-g")
 	if len(before) != 1 || !strings.Contains(before[0], "-g1_") {
 		t.Fatalf("expected one generation-1 consumer, got %v", before)
 	}
@@ -562,7 +562,7 @@ func TestSeekRestartsWithNewGeneration(t *testing.T) {
 		t.Errorf("expected first message after Seek(50) to be 51, got %d", got)
 	}
 
-	after := consumerNamesWithPrefix(t, js, impl.owner)
+	after := consumerNamesWithPrefix(t, js, impl.owner+"-g")
 	if len(after) != 1 || !strings.Contains(after[0], "-g2_") {
 		t.Errorf("expected exactly one generation-2 consumer after seek, got %v", after)
 	}
@@ -639,11 +639,10 @@ func TestDeleteConsumer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewConsumer (for delete): %v", err)
 	}
-	impl2 := c2.(*offsetConsumer)
-	if impl2.startSeq == 0 {
-		t.Fatal("expected non-zero startSeq before delete")
+	if storedSeq(t, c2) == 0 {
+		t.Fatal("expected a non-zero stored offset before delete")
 	}
-	t.Logf("Before delete: startSeq=%d", impl2.startSeq)
+	t.Logf("Before delete: stored=%d", storedSeq(t, c2))
 
 	err = c2.DeleteConsumer(ctx)
 	if err != nil {
@@ -686,7 +685,7 @@ func TestInvalidConsumerName(t *testing.T) {
 		Stream:       testStream,
 		ConsumerName: "",
 	})
-	if err != ErrInvalidConsumerName {
+	if !errors.Is(err, ErrInvalidConsumerName) {
 		t.Errorf("expected ErrInvalidConsumerName for empty name, got %v", err)
 	}
 
@@ -695,8 +694,22 @@ func TestInvalidConsumerName(t *testing.T) {
 		Stream:       testStream,
 		ConsumerName: "has.dot",
 	})
-	if err != ErrInvalidConsumerName {
+	if !errors.Is(err, ErrInvalidConsumerName) {
 		t.Errorf("expected ErrInvalidConsumerName for dotted name, got %v", err)
+	}
+
+	for _, name := range []string{"has*star", "has>gt", "has space", "has/slash", strings.Repeat("x", 200)} {
+		_, err = NewConsumer(ctx, js, ConsumerConfig{Stream: testStream, ConsumerName: name})
+		if !errors.Is(err, ErrInvalidConsumerName) {
+			t.Errorf("expected ErrInvalidConsumerName for %q, got %v", name, err)
+		}
+	}
+	_, err = NewConsumer(ctx, js, ConsumerConfig{Stream: "bad stream", ConsumerName: "ok"})
+	if !errors.Is(err, ErrInvalidStreamName) {
+		t.Errorf("expected ErrInvalidStreamName, got %v", err)
+	}
+	if _, err = NewConsumer(ctx, js, ConsumerConfig{Stream: testStream, ConsumerName: "Ok_name-1=x"}); err != nil {
+		t.Errorf("valid name rejected: %v", err)
 	}
 
 	t.Log("Invalid consumer name validation works correctly")
@@ -796,12 +809,18 @@ func TestInfoAndListHaveOwner(t *testing.T) {
 		c.DeleteConsumer(ctx)
 	}()
 
+	if info, err := c.Info(ctx); err != nil || info != nil {
+		t.Fatalf("expected no entry before Consume (no claim yet), got %+v (%v)", info, err)
+	}
+	if err := c.Consume(func(jetstream.Msg) {}); err != nil {
+		t.Fatalf("Consume: %v", err)
+	}
 	info, err := c.Info(ctx)
 	if err != nil {
 		t.Fatalf("Info: %v", err)
 	}
 	if info == nil {
-		t.Fatal("expected an entry right after NewConsumer (claim)")
+		t.Fatal("expected an entry right after Consume (claim)")
 	}
 	wantPrefix := "oc-" + testStream + "-" + consumerName + "-"
 	if !strings.HasPrefix(info.Owner, wantPrefix) {
@@ -811,14 +830,13 @@ func TestInfoAndListHaveOwner(t *testing.T) {
 	if info.Host != host {
 		t.Errorf("host %q, want %q", info.Host, host)
 	}
-	if _, err := time.Parse(time.RFC3339, info.ClaimedAt); err != nil {
-		t.Errorf("claimed_at %q is not RFC3339: %v", info.ClaimedAt, err)
-	}
 	if info.Seq != 0 {
 		t.Errorf("expected seq 0 before any commit, got %d", info.Seq)
 	}
 
-	consumeUntilDelivered(t, c)
+	if !waitUntil(5*time.Second, func() bool { return lastDelivered(c) > 0 }) {
+		t.Fatal("no messages delivered")
+	}
 	if err := c.CommitSync(ctx); err != nil {
 		t.Fatalf("CommitSync: %v", err)
 	}
@@ -837,7 +855,7 @@ func TestInfoAndListHaveOwner(t *testing.T) {
 
 	// The commit must have kept the ownership fields.
 	after, _ := c.Info(ctx)
-	if after.Owner != info.Owner || after.ClaimedAt != info.ClaimedAt {
+	if after.Owner != info.Owner || after.Host != info.Host {
 		t.Errorf("commit changed ownership fields: before %+v after %+v", info, after)
 	}
 }
@@ -882,7 +900,7 @@ func TestSecondInstanceRefused(t *testing.T) {
 	if !errors.As(err, &inUse) {
 		t.Fatalf("expected *AlreadyInUseError, got %T", err)
 	}
-	if inUse.Owner != info.Owner || inUse.Host != info.Host || inUse.ClaimedAt != info.ClaimedAt {
+	if inUse.Owner != info.Owner || inUse.Host != info.Host {
 		t.Errorf("error details %+v do not match entry %+v", inUse, info)
 	}
 	t.Logf("refused: %v", err)
@@ -918,7 +936,7 @@ func TestReleaseOnClose(t *testing.T) {
 	owner1 := c1.(*offsetConsumer).owner
 	committed := lastDelivered(c1)
 
-	if names := consumerNamesWithPrefix(t, js, owner1); len(names) != 1 {
+	if names := consumerNamesWithPrefix(t, js, owner1+"-g"); len(names) != 1 {
 		t.Fatalf("expected one live ordered consumer before close, got %v", names)
 	}
 	if err := c1.Close(); err != nil {
@@ -932,7 +950,7 @@ func TestReleaseOnClose(t *testing.T) {
 	if err != nil || info == nil {
 		t.Fatalf("Info after close: info=%+v err=%v", info, err)
 	}
-	if info.Owner != "" || info.Host != "" || info.ClaimedAt != "" {
+	if info.Owner != "" || info.Host != "" {
 		t.Errorf("expected ownership released on close, got %+v", info)
 	}
 	if info.Seq != committed {
@@ -951,6 +969,9 @@ func TestReleaseOnClose(t *testing.T) {
 		c2.Close()
 		c2.DeleteConsumer(ctx)
 	}()
+	if err := c2.Consume(func(jetstream.Msg) {}); err != nil {
+		t.Fatalf("Consume after restart: %v", err)
+	}
 	info2, _ := c2.Info(ctx)
 	if info2.Owner == "" || info2.Owner == owner1 {
 		t.Errorf("expected a fresh owner, got %q", info2.Owner)
@@ -1013,10 +1034,14 @@ func TestCrashRecovery(t *testing.T) {
 		c2.Close()
 		c2.DeleteConsumer(ctx)
 	}()
-	t.Logf("recovered after %v", time.Since(start).Round(100*time.Millisecond))
 	if names := consumerNamesWithPrefix(t, js, owner1); len(names) != 0 {
 		t.Errorf("crashed owner's consumer still present: %v", names)
 	}
+	// The claim at Consume waits livenessWait before taking over.
+	if err := c2.Consume(func(jetstream.Msg) {}); err != nil {
+		t.Fatalf("Consume after recovery: %v", err)
+	}
+	t.Logf("recovered after %v", time.Since(start).Round(100*time.Millisecond))
 	if info, _ := c2.Info(ctx); info == nil || info.Owner == owner1 {
 		t.Errorf("expected a new owner after recovery, got %+v", info)
 	}
@@ -1111,5 +1136,831 @@ func TestCloseWithCommitBacklog(t *testing.T) {
 	}
 	if names := consumerNamesWithPrefix(t, js, owner); len(names) != 0 {
 		t.Errorf("ordered consumer still present: %v", names)
+	}
+}
+
+// newTestConsumer creates a consumer with a unique name and registers cleanup.
+func newTestConsumer(t *testing.T, js jetstream.JetStream, cfg ConsumerConfig) OffsetConsumer {
+	t.Helper()
+	if cfg.Stream == "" {
+		cfg.Stream = testStream
+	}
+	if cfg.ConsumerName == "" {
+		cfg.ConsumerName = fmt.Sprintf("c-%d", time.Now().UnixNano())
+	}
+	c, err := NewConsumer(context.Background(), js, cfg)
+	if err != nil {
+		t.Fatalf("NewConsumer: %v", err)
+	}
+	t.Cleanup(func() { c.Close() })
+	return c
+}
+
+func storedSeq(t *testing.T, c OffsetConsumer) uint64 {
+	t.Helper()
+	info, err := c.Info(context.Background())
+	if err != nil {
+		t.Fatalf("Info: %v", err)
+	}
+	if info == nil {
+		return 0
+	}
+	return info.Seq
+}
+
+// Auto-commit must not commit a message whose handler is still running.
+func TestAutoCommitSkipsMessageInHandler(t *testing.T) {
+	srv := RunBasicJetStreamServer()
+	t.Cleanup(func() { shutdownJSServerAndRemoveStorage(t, srv) })
+	js := setupStream(t, srv.ClientURL())
+
+	c := newTestConsumer(t, js, ConsumerConfig{AutoCommit: true, AutoCommitInterval: 100 * time.Millisecond})
+	release := make(chan struct{})
+	var handled atomic.Int64
+	if err := c.Consume(func(msg jetstream.Msg) {
+		md, _ := msg.Metadata()
+		if md.Sequence.Stream == 3 {
+			<-release
+		}
+		handled.Store(int64(md.Sequence.Stream))
+	}); err != nil {
+		t.Fatalf("Consume: %v", err)
+	}
+
+	if !waitUntil(5*time.Second, func() bool { return storedSeq(t, c) == 2 }) {
+		t.Fatalf("expected stored seq 2 while message 3 is in its handler, got %d", storedSeq(t, c))
+	}
+	time.Sleep(500 * time.Millisecond)
+	if got := storedSeq(t, c); got != 2 {
+		t.Fatalf("auto-commit committed a message still in its handler: stored %d", got)
+	}
+	close(release)
+	if !waitUntil(5*time.Second, func() bool { return storedSeq(t, c) == numMessages }) {
+		t.Fatalf("expected all messages committed after release, got %d", storedSeq(t, c))
+	}
+}
+
+// Close with auto-commit must not commit a message whose handler is still running.
+func TestCloseAutoCommitSkipsMessageInHandler(t *testing.T) {
+	srv := RunBasicJetStreamServer()
+	t.Cleanup(func() { shutdownJSServerAndRemoveStorage(t, srv) })
+	js := setupStream(t, srv.ClientURL())
+	name := fmt.Sprintf("c-%d", time.Now().UnixNano())
+
+	c, err := NewConsumer(context.Background(), js, ConsumerConfig{Stream: testStream, ConsumerName: name, AutoCommit: true, AutoCommitInterval: time.Hour})
+	if err != nil {
+		t.Fatalf("NewConsumer: %v", err)
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	if err := c.Consume(func(msg jetstream.Msg) {
+		md, _ := msg.Metadata()
+		if md.Sequence.Stream == 5 {
+			close(entered)
+			<-release
+		}
+	}); err != nil {
+		t.Fatalf("Consume: %v", err)
+	}
+	<-entered
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	close(release)
+
+	c2 := newTestConsumer(t, connect(t, srv.ClientURL()), ConsumerConfig{ConsumerName: name})
+	if got := storedSeq(t, c2); got != 4 {
+		t.Fatalf("expected stored seq 4 (message 5 was still in its handler), got %d", got)
+	}
+}
+
+// StartPositionEnd is resolved at creation and stored by the claim, so an end
+// consumer that received nothing before closing resumes there: messages
+// published while it is down are delivered on the next start.
+func TestStartPositionEndPersisted(t *testing.T) {
+	srv := RunBasicJetStreamServer()
+	t.Cleanup(func() { shutdownJSServerAndRemoveStorage(t, srv) })
+	js := setupStream(t, srv.ClientURL())
+	ctx := context.Background()
+	name := fmt.Sprintf("c-%d", time.Now().UnixNano())
+
+	c, err := NewConsumer(ctx, js, ConsumerConfig{Stream: testStream, ConsumerName: name, StartPosition: StartPositionEnd})
+	if err != nil {
+		t.Fatalf("NewConsumer: %v", err)
+	}
+	for i := 0; i < 2; i++ { // published after creation, before Consume
+		if _, err := js.Publish(ctx, "test.early", []byte("early")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := c.Consume(func(jetstream.Msg) {}); err != nil {
+		t.Fatalf("Consume: %v", err)
+	}
+	if !waitUntil(5*time.Second, func() bool { return lastDelivered(c) == numMessages+2 }) {
+		t.Fatalf("expected the messages published after creation, last delivered %d", lastDelivered(c))
+	}
+	if err := c.CommitSync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	for i := 0; i < 3; i++ {
+		if _, err := js.Publish(ctx, "test.new", []byte("new")); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	c2 := newTestConsumer(t, js, ConsumerConfig{ConsumerName: name, StartPosition: StartPositionEnd})
+	var first atomic.Uint64
+	if err := c2.Consume(func(msg jetstream.Msg) {
+		md, _ := msg.Metadata()
+		first.CompareAndSwap(0, md.Sequence.Stream)
+	}); err != nil {
+		t.Fatalf("Consume: %v", err)
+	}
+	if !waitUntil(5*time.Second, func() bool { return lastDelivered(c2) == numMessages+5 }) {
+		t.Fatalf("expected messages published while down, last delivered %d", lastDelivered(c2))
+	}
+	if first.Load() != numMessages+3 {
+		t.Fatalf("expected first message %d, got %d", numMessages+3, first.Load())
+	}
+}
+
+// SeekToBeginning goes to the beginning even with StartPositionEnd.
+func TestSeekToBeginningWithStartPositionEnd(t *testing.T) {
+	srv := RunBasicJetStreamServer()
+	t.Cleanup(func() { shutdownJSServerAndRemoveStorage(t, srv) })
+	js := setupStream(t, srv.ClientURL())
+
+	c := newTestConsumer(t, js, ConsumerConfig{StartPosition: StartPositionEnd})
+	var first atomic.Uint64
+	if err := c.Consume(func(msg jetstream.Msg) {
+		md, _ := msg.Metadata()
+		first.CompareAndSwap(0, md.Sequence.Stream)
+	}); err != nil {
+		t.Fatalf("Consume: %v", err)
+	}
+	if err := c.SeekToBeginning(context.Background()); err != nil {
+		t.Fatalf("SeekToBeginning: %v", err)
+	}
+	if !waitUntil(5*time.Second, func() bool { return lastDelivered(c) == numMessages }) {
+		t.Fatalf("expected all messages after SeekToBeginning, last delivered %d", lastDelivered(c))
+	}
+	if first.Load() != 1 {
+		t.Fatalf("expected first message 1, got %d", first.Load())
+	}
+}
+
+// An existing bucket's configuration is not overwritten.
+func TestExistingBucketNotOverwritten(t *testing.T) {
+	srv := RunBasicJetStreamServer()
+	t.Cleanup(func() { shutdownJSServerAndRemoveStorage(t, srv) })
+	js := setupStream(t, srv.ClientURL())
+	ctx := context.Background()
+
+	if _, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: kvBucketName, Description: "operator managed", History: 1}); err != nil {
+		t.Fatalf("create bucket: %v", err)
+	}
+	newTestConsumer(t, js, ConsumerConfig{})
+	kv, err := js.KeyValue(ctx, kvBucketName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, err := kv.Status(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := status.(*jetstream.KeyValueBucketStatus).StreamInfo().Config
+	if cfg.Description != "operator managed" {
+		t.Fatalf("bucket configuration was overwritten: description %q", cfg.Description)
+	}
+}
+
+// Concurrent seeks leave exactly one ordered consumer.
+func TestConcurrentSeeks(t *testing.T) {
+	srv := RunBasicJetStreamServer()
+	t.Cleanup(func() { shutdownJSServerAndRemoveStorage(t, srv) })
+	js := setupStream(t, srv.ClientURL())
+	ctx := context.Background()
+
+	c := newTestConsumer(t, js, ConsumerConfig{})
+	consumeUntilDelivered(t, c)
+	owner := c.(*offsetConsumer).owner
+
+	done := make(chan error, 10)
+	for i := 0; i < 10; i++ {
+		go func(i int) { done <- c.Seek(ctx, uint64(i*5)) }(i)
+	}
+	for i := 0; i < 10; i++ {
+		if err := <-done; err != nil {
+			t.Fatalf("Seek: %v", err)
+		}
+	}
+	time.Sleep(200 * time.Millisecond)
+	if names := consumerNamesWithPrefix(t, js, owner+"-g"); len(names) != 1 {
+		t.Fatalf("expected exactly one ordered consumer, got %v", names)
+	}
+}
+
+// The ErrorHandler may call Close when an auto-commit fails.
+func TestErrorHandlerCanCloseOnAutoCommitFailure(t *testing.T) {
+	srv := RunBasicJetStreamServer()
+	t.Cleanup(func() { shutdownJSServerAndRemoveStorage(t, srv) })
+	js := setupStream(t, srv.ClientURL())
+	ctx := context.Background()
+
+	closed := make(chan error, 1)
+	var once atomic.Bool
+	c := newTestConsumer(t, js, ConsumerConfig{
+		AutoCommit:         true,
+		AutoCommitInterval: 200 * time.Millisecond,
+		ErrorHandler: func(oc OffsetConsumer, err error) {
+			if strings.Contains(err.Error(), "auto-commit failed") && once.CompareAndSwap(false, true) {
+				closed <- oc.Close()
+			}
+		},
+	})
+	if err := c.Consume(func(msg jetstream.Msg) {}); err != nil {
+		t.Fatalf("Consume: %v", err)
+	}
+	// Make commits fail: without the bucket, KV writes get no responders.
+	if err := js.DeleteKeyValue(ctx, kvBucketName); err != nil {
+		t.Fatalf("delete bucket: %v", err)
+	}
+	select {
+	case <-closed:
+	case <-time.After(15 * time.Second):
+		t.Fatal("Close called from the ErrorHandler did not return (deadlock)")
+	}
+}
+
+// A commit whose ack never arrives fails instead of hanging forever.
+func TestCommitAckTimeout(t *testing.T) {
+	old := commitAckTimeout
+	commitAckTimeout = 300 * time.Millisecond
+	defer func() { commitAckTimeout = old }()
+
+	srv := RunBasicJetStreamServer()
+	t.Cleanup(func() { shutdownJSServerAndRemoveStorage(t, srv) })
+	js := setupStream(t, srv.ClientURL())
+	ctx := context.Background()
+
+	c := newTestConsumer(t, js, ConsumerConfig{})
+	consumeUntilDelivered(t, c)
+
+	// Swallow KV writes: delete the bucket and answer nothing on its subjects.
+	if err := js.DeleteKeyValue(ctx, kvBucketName); err != nil {
+		t.Fatalf("delete bucket: %v", err)
+	}
+	sub, err := js.Conn().Subscribe("$KV."+kvBucketName+".>", func(*nats.Msg) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Unsubscribe()
+
+	errc := make(chan error, 1)
+	go func() { errc <- c.CommitSync(context.Background()) }()
+	select {
+	case err := <-errc:
+		if !errors.Is(err, jetstream.ErrAsyncPublishTimeout) {
+			t.Fatalf("expected ack timeout, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("CommitSync hung on a lost ack")
+	}
+}
+
+// recreateStream deletes the test stream, recreates it empty, and publishes n messages.
+func recreateStream(t *testing.T, js jetstream.JetStream, n int) {
+	t.Helper()
+	ctx := context.Background()
+	if err := js.DeleteStream(ctx, testStream); err != nil {
+		t.Fatalf("delete stream: %v", err)
+	}
+	if _, err := js.CreateStream(ctx, jetstream.StreamConfig{Name: testStream, Subjects: []string{"test.>"}}); err != nil {
+		t.Fatalf("create stream: %v", err)
+	}
+	for i := 1; i <= n; i++ {
+		if _, err := js.Publish(ctx, "test.again", []byte("again")); err != nil {
+			t.Fatalf("publish: %v", err)
+		}
+	}
+}
+
+// A stored offset from a previous incarnation of the stream is reset.
+func TestStreamRecreatedAtStartup(t *testing.T) {
+	srv := RunBasicJetStreamServer()
+	t.Cleanup(func() { shutdownJSServerAndRemoveStorage(t, srv) })
+	js := setupStream(t, srv.ClientURL())
+	ctx := context.Background()
+	name := fmt.Sprintf("c-%d", time.Now().UnixNano())
+
+	c, err := NewConsumer(ctx, js, ConsumerConfig{Stream: testStream, ConsumerName: name})
+	if err != nil {
+		t.Fatal(err)
+	}
+	consumeUntilDelivered(t, c)
+	waitUntil(5*time.Second, func() bool { return lastDelivered(c) == numMessages })
+	if err := c.CommitSync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	c.Close()
+
+	recreateStream(t, js, numMessages+20) // passes the old position: only the stream identity tells
+	var reported atomic.Bool
+	c2 := newTestConsumer(t, js, ConsumerConfig{ConsumerName: name, ErrorHandler: func(_ OffsetConsumer, err error) {
+		if errors.Is(err, ErrStreamRecreated) {
+			reported.Store(true)
+		}
+	}})
+	if err := c2.Consume(func(jetstream.Msg) {}); err != nil { // the claim detects it
+		t.Fatal(err)
+	}
+	if !reported.Load() {
+		t.Fatal("ErrStreamRecreated not reported")
+	}
+	if got := c2.(*offsetConsumer).startSeq; got != 0 {
+		t.Fatalf("expected offset reset to 0, got %d", got)
+	}
+}
+
+// Legacy entries (no stream identity) past the stream's end are reset.
+func TestStreamRecreatedLegacyEntry(t *testing.T) {
+	srv := RunBasicJetStreamServer()
+	t.Cleanup(func() { shutdownJSServerAndRemoveStorage(t, srv) })
+	js := setupStream(t, srv.ClientURL())
+	ctx := context.Background()
+	name := fmt.Sprintf("c-%d", time.Now().UnixNano())
+
+	kv, err := ensureBucket(ctx, js, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := kv.Put(ctx, testStream+"."+name, []byte(`{"seq":5000,"committed_at":"2026-01-01T00:00:00Z"}`)); err != nil {
+		t.Fatal(err)
+	}
+	c := newTestConsumer(t, js, ConsumerConfig{ConsumerName: name})
+	if err := c.Consume(func(jetstream.Msg) {}); err != nil { // the claim resets it
+		t.Fatal(err)
+	}
+	if got := c.(*offsetConsumer).startSeq; got != 0 {
+		t.Fatalf("expected legacy offset beyond the stream end to be reset, got %d", got)
+	}
+}
+
+// A stream deleted and recreated while consuming is detected through the
+// ordered consumer reset, and consumption restarts from the beginning.
+func TestStreamRecreatedWhileConsuming(t *testing.T) {
+	srv := RunBasicJetStreamServer()
+	t.Cleanup(func() { shutdownJSServerAndRemoveStorage(t, srv) })
+	js := setupStream(t, srv.ClientURL())
+
+	var reported atomic.Bool
+	var seqs atomic.Int64
+	c := newTestConsumer(t, js, ConsumerConfig{ErrorHandler: func(_ OffsetConsumer, err error) {
+		if errors.Is(err, ErrStreamRecreated) {
+			reported.Store(true)
+		}
+	}})
+	var afterReset atomic.Int64
+	if err := c.Consume(func(msg jetstream.Msg) {
+		seqs.Add(1)
+		if reported.Load() {
+			afterReset.Add(1)
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !waitUntil(5*time.Second, func() bool { return lastDelivered(c) == numMessages }) {
+		t.Fatal("initial messages not delivered")
+	}
+
+	recreateStream(t, js, 10)
+	if !waitUntil(20*time.Second, func() bool { return reported.Load() }) {
+		t.Fatal("stream recreation not detected")
+	}
+	if !waitUntil(10*time.Second, func() bool { return afterReset.Load() >= 10 }) {
+		t.Fatalf("expected the 10 messages of the new stream, got %d", afterReset.Load())
+	}
+}
+
+// Several instances starting to consume at the same time: exactly one wins
+// the claim, and only its ordered consumer exists.
+func TestConcurrentStarters(t *testing.T) {
+	srv := RunBasicJetStreamServer()
+	t.Cleanup(func() { shutdownJSServerAndRemoveStorage(t, srv) })
+	js := setupStream(t, srv.ClientURL())
+	name := fmt.Sprintf("c-%d", time.Now().UnixNano())
+
+	type result struct {
+		c   OffsetConsumer
+		err error
+	}
+	results := make(chan result, 4)
+	for i := 0; i < 4; i++ {
+		go func() {
+			c, err := NewConsumer(context.Background(), connect(t, srv.ClientURL()), ConsumerConfig{Stream: testStream, ConsumerName: name})
+			if err == nil {
+				if err = c.Consume(func(jetstream.Msg) {}); err != nil {
+					c.Close()
+				}
+			}
+			results <- result{c, err}
+		}()
+	}
+	var winners []OffsetConsumer
+	for i := 0; i < 4; i++ {
+		r := <-results
+		if r.err == nil {
+			winners = append(winners, r.c)
+		} else if !errors.Is(r.err, ErrAlreadyInUse) {
+			t.Fatalf("unexpected error: %v", r.err)
+		}
+	}
+	if len(winners) != 1 {
+		t.Fatalf("expected exactly one winner, got %d", len(winners))
+	}
+	defer winners[0].Close()
+	if names := consumerNamesWithPrefix(t, js, "oc-"+testStream+"-"+name+"-"); len(names) != 1 ||
+		!strings.HasPrefix(names[0], winners[0].(*offsetConsumer).owner) {
+		t.Fatalf("expected only the winner's ordered consumer, got %v", names)
+	}
+}
+
+// Close does not release an entry that another instance claimed meanwhile
+// (an instance displaced without noticing): the entry is left untouched and
+// Close reports ErrAlreadyInUse.
+func TestCloseSkipsReleaseOfForeignEntry(t *testing.T) {
+	srv := RunBasicJetStreamServer()
+	t.Cleanup(func() { shutdownJSServerAndRemoveStorage(t, srv) })
+	js := setupStream(t, srv.ClientURL())
+	ctx := context.Background()
+
+	c := newTestConsumer(t, js, ConsumerConfig{})
+	consumeUntilDelivered(t, c)
+	impl := c.(*offsetConsumer)
+	other := `{"seq":3,"committed_at":"","owner":"oc-someone-else","host":"h"}`
+	if _, err := impl.kv.Put(ctx, impl.kvKey, []byte(other)); err != nil {
+		t.Fatal(err)
+	}
+
+	err := c.Close()
+	var inUse *AlreadyInUseError
+	if !errors.Is(err, ErrAlreadyInUse) || !errors.As(err, &inUse) || inUse.Owner != "oc-someone-else" {
+		t.Fatalf("expected ErrAlreadyInUse naming the new owner, got %v", err)
+	}
+	if info, _ := c.Info(ctx); info == nil || info.Owner != "oc-someone-else" || info.Seq != 3 {
+		t.Fatalf("Close overwrote the other owner's entry: %+v", info)
+	}
+	if names := consumerNamesWithPrefix(t, js, impl.owner); len(names) != 0 {
+		t.Fatalf("consumers left behind after Close: %v", names)
+	}
+}
+
+// Close does not recreate an entry deleted by someone else.
+func TestCloseSkipsReleaseOfDeletedEntry(t *testing.T) {
+	srv := RunBasicJetStreamServer()
+	t.Cleanup(func() { shutdownJSServerAndRemoveStorage(t, srv) })
+	js := setupStream(t, srv.ClientURL())
+	ctx := context.Background()
+
+	c := newTestConsumer(t, js, ConsumerConfig{})
+	consumeUntilDelivered(t, c) // claims the entry
+	impl := c.(*offsetConsumer)
+	if err := impl.kv.Delete(ctx, impl.kvKey); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if info, err := c.Info(ctx); err != nil || info != nil {
+		t.Fatalf("expected no entry, got %+v (%v)", info, err)
+	}
+}
+
+// The conditional release still succeeds right after a burst of async
+// commits whose acks may land between its read and its write.
+func TestCloseReleasesAfterCommitBurst(t *testing.T) {
+	srv := RunBasicJetStreamServer()
+	t.Cleanup(func() { shutdownJSServerAndRemoveStorage(t, srv) })
+	js := setupStream(t, srv.ClientURL())
+	ctx := context.Background()
+
+	c := newTestConsumer(t, js, ConsumerConfig{})
+	if err := c.Consume(func(jetstream.Msg) {
+		if _, err := c.CommitAsync(); err != nil {
+			t.Errorf("CommitAsync: %v", err)
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !waitUntil(5*time.Second, func() bool { return lastDelivered(c) == numMessages }) {
+		t.Fatal("messages not delivered")
+	}
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	info, err := c.Info(ctx)
+	if err != nil || info == nil || info.Owner != "" || info.Seq != numMessages {
+		t.Fatalf("expected a released entry at %d, got %+v (%v)", numMessages, info, err)
+	}
+}
+
+// withLivenessWait sets the takeover wait for one test.
+func withLivenessWait(t *testing.T, d time.Duration) {
+	old := livenessWait
+	livenessWait = d
+	t.Cleanup(func() { livenessWait = old })
+}
+
+// putOwnedEntry stores an entry owned by owner, an instance that has no
+// consumer on the server.
+func putOwnedEntry(t *testing.T, js jetstream.JetStream, name, owner string, seq uint64) {
+	t.Helper()
+	ctx := context.Background()
+	kv, err := ensureBucket(ctx, js, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := fmt.Sprintf(`{"seq":%d,"committed_at":"","owner":"%s","host":"h"}`, seq, owner)
+	if _, err := kv.Put(ctx, testStream+"."+name, []byte(entry)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Nothing is written before the first Consume: construction, commits and
+// Close leave no entry and no consumer behind.
+func TestNoWritesBeforeConsume(t *testing.T) {
+	srv := RunBasicJetStreamServer()
+	t.Cleanup(func() { shutdownJSServerAndRemoveStorage(t, srv) })
+	js := setupStream(t, srv.ClientURL())
+	ctx := context.Background()
+
+	c := newTestConsumer(t, js, ConsumerConfig{})
+	if err := c.CommitSync(ctx); err != nil {
+		t.Fatalf("CommitSync: %v", err)
+	}
+	f, err := c.CommitAsync()
+	if err != nil {
+		t.Fatalf("CommitAsync: %v", err)
+	}
+	<-f.Ok()
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if info, err := c.Info(ctx); err != nil || info != nil {
+		t.Fatalf("expected no entry, got %+v (%v)", info, err)
+	}
+	if names := consumerNamesWithPrefix(t, js, "oc-"); len(names) != 0 {
+		t.Fatalf("expected no consumers, got %v", names)
+	}
+}
+
+// Two instances may be constructed while the entry is unowned; the second
+// one to Consume is refused because the first one's ordered consumer exists.
+func TestSecondConsumeRefused(t *testing.T) {
+	srv := RunBasicJetStreamServer()
+	t.Cleanup(func() { shutdownJSServerAndRemoveStorage(t, srv) })
+	js := setupStream(t, srv.ClientURL())
+	name := fmt.Sprintf("c-%d", time.Now().UnixNano())
+
+	a := newTestConsumer(t, js, ConsumerConfig{ConsumerName: name})
+	b := newTestConsumer(t, connect(t, srv.ClientURL()), ConsumerConfig{ConsumerName: name})
+	if err := a.Consume(func(jetstream.Msg) {}); err != nil {
+		t.Fatalf("Consume a: %v", err)
+	}
+	err := b.Consume(func(jetstream.Msg) {})
+	var inUse *AlreadyInUseError
+	if !errors.As(err, &inUse) || inUse.Owner != a.(*offsetConsumer).owner {
+		t.Fatalf("expected AlreadyInUse naming a, got %v", err)
+	}
+	if err := b.Close(); err != nil {
+		t.Fatalf("Close b: %v", err)
+	}
+	if info, _ := a.Info(context.Background()); info == nil || info.Owner != a.(*offsetConsumer).owner {
+		t.Fatalf("refused instance disturbed the entry: %+v", info)
+	}
+}
+
+// An owner without a consumer is taken over only after the liveness wait,
+// keeping the stored offset.
+func TestTakeoverAfterLivenessWait(t *testing.T) {
+	withLivenessWait(t, time.Second)
+	srv := RunBasicJetStreamServer()
+	t.Cleanup(func() { shutdownJSServerAndRemoveStorage(t, srv) })
+	js := setupStream(t, srv.ClientURL())
+	name := fmt.Sprintf("c-%d", time.Now().UnixNano())
+
+	putOwnedEntry(t, js, name, "oc-gone-owner", 7)
+	c := newTestConsumer(t, js, ConsumerConfig{ConsumerName: name})
+	start := time.Now()
+	if err := c.Consume(func(jetstream.Msg) {}); err != nil {
+		t.Fatalf("Consume: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed < livenessWait {
+		t.Fatalf("took over after %v, before the liveness wait", elapsed)
+	}
+	if got := c.(*offsetConsumer).startSeq; got != 7 {
+		t.Fatalf("expected the stored offset 7, got %d", got)
+	}
+	if info, _ := c.Info(context.Background()); info == nil || info.Owner != c.(*offsetConsumer).owner {
+		t.Fatalf("expected the entry claimed, got %+v", info)
+	}
+}
+
+// A consumer of the owner that appears during the wait (an ordered consumer
+// being recreated) makes the takeover fail.
+func TestConsumerAppearingDuringWaitRefuses(t *testing.T) {
+	withLivenessWait(t, time.Second)
+	srv := RunBasicJetStreamServer()
+	t.Cleanup(func() { shutdownJSServerAndRemoveStorage(t, srv) })
+	js := setupStream(t, srv.ClientURL())
+	ctx := context.Background()
+	name := fmt.Sprintf("c-%d", time.Now().UnixNano())
+	owner := "oc-resetting-owner"
+
+	putOwnedEntry(t, js, name, owner, 0)
+	c := newTestConsumer(t, js, ConsumerConfig{ConsumerName: name})
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		_, _ = js.CreateConsumer(ctx, testStream, jetstream.ConsumerConfig{
+			Name: owner + "-g1_2", InactiveThreshold: time.Minute,
+		})
+	}()
+	if err := c.Consume(func(jetstream.Msg) {}); !errors.Is(err, ErrAlreadyInUse) {
+		t.Fatalf("expected ErrAlreadyInUse, got %v", err)
+	}
+}
+
+// A write to the entry during the wait (here a commit by the owner) makes
+// the CAS claim fail.
+func TestWriteDuringWaitRefuses(t *testing.T) {
+	withLivenessWait(t, time.Second)
+	srv := RunBasicJetStreamServer()
+	t.Cleanup(func() { shutdownJSServerAndRemoveStorage(t, srv) })
+	js := setupStream(t, srv.ClientURL())
+	name := fmt.Sprintf("c-%d", time.Now().UnixNano())
+	owner := "oc-committing-owner"
+
+	putOwnedEntry(t, js, name, owner, 3)
+	c := newTestConsumer(t, js, ConsumerConfig{ConsumerName: name})
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		putOwnedEntry(t, js, name, owner, 4)
+	}()
+	if err := c.Consume(func(jetstream.Msg) {}); !errors.Is(err, ErrAlreadyInUse) {
+		t.Fatalf("expected ErrAlreadyInUse, got %v", err)
+	}
+	if info, _ := c.Info(context.Background()); info == nil || info.Owner != owner || info.Seq != 4 {
+		t.Fatalf("expected the owner's write to stand, got %+v", info)
+	}
+}
+
+// A seek creates the new ordered consumer before deleting the old one: the
+// instance always has a consumer on the server.
+func TestSeekKeepsConsumerVisible(t *testing.T) {
+	srv := RunBasicJetStreamServer()
+	t.Cleanup(func() { shutdownJSServerAndRemoveStorage(t, srv) })
+	js := setupStream(t, srv.ClientURL())
+	ctx := context.Background()
+
+	c := newTestConsumer(t, js, ConsumerConfig{})
+	consumeUntilDelivered(t, c)
+	owner := c.(*offsetConsumer).owner
+
+	stop := make(chan struct{})
+	var gaps atomic.Int64
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		stream, _ := js.Stream(ctx, testStream)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			alive, err := isOwnerAlive(ctx, stream, owner)
+			if err == nil && !alive {
+				gaps.Add(1)
+			}
+		}
+	}()
+	for i := 0; i < 20; i++ {
+		if err := c.Seek(ctx, uint64(i)); err != nil {
+			t.Fatalf("Seek: %v", err)
+		}
+	}
+	close(stop)
+	<-done
+	if n := gaps.Load(); n != 0 {
+		t.Fatalf("the instance had no consumer on the server %d times during seeks", n)
+	}
+	if names := consumerNamesWithPrefix(t, js, owner); len(names) != 1 || !strings.HasPrefix(names[0], owner+"-g21") {
+		t.Fatalf("expected only the latest generation, got %v", names)
+	}
+}
+
+// A seek before the first Consume is only recorded, and stored by the claim.
+func TestSeekBeforeConsumeStoredByClaim(t *testing.T) {
+	srv := RunBasicJetStreamServer()
+	t.Cleanup(func() { shutdownJSServerAndRemoveStorage(t, srv) })
+	js := setupStream(t, srv.ClientURL())
+	ctx := context.Background()
+
+	c := newTestConsumer(t, js, ConsumerConfig{})
+	if err := c.Seek(ctx, 42); err != nil {
+		t.Fatalf("Seek: %v", err)
+	}
+	if info, err := c.Info(ctx); err != nil || info != nil {
+		t.Fatalf("expected no write before Consume, got %+v (%v)", info, err)
+	}
+	var first atomic.Uint64
+	if err := c.Consume(func(msg jetstream.Msg) {
+		md, _ := msg.Metadata()
+		first.CompareAndSwap(0, md.Sequence.Stream)
+	}); err != nil {
+		t.Fatalf("Consume: %v", err)
+	}
+	if got := storedSeq(t, c); got != 42 {
+		t.Fatalf("expected the claim to store 42, got %d", got)
+	}
+	if !waitUntil(5*time.Second, func() bool { return first.Load() != 0 }) || first.Load() != 43 {
+		t.Fatalf("expected delivery from 43, got %d", first.Load())
+	}
+}
+
+// A stream recreated between construction and Consume is detected by the
+// claim: the stored offset of the old stream is not used.
+func TestStreamRecreatedBeforeConsume(t *testing.T) {
+	srv := RunBasicJetStreamServer()
+	t.Cleanup(func() { shutdownJSServerAndRemoveStorage(t, srv) })
+	js := setupStream(t, srv.ClientURL())
+	ctx := context.Background()
+	name := fmt.Sprintf("c-%d", time.Now().UnixNano())
+
+	c1 := newTestConsumer(t, js, ConsumerConfig{ConsumerName: name})
+	consumeUntilDelivered(t, c1)
+	waitUntil(5*time.Second, func() bool { return lastDelivered(c1) == numMessages })
+	if err := c1.CommitSync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	c1.Close()
+
+	var reported atomic.Bool
+	c2 := newTestConsumer(t, js, ConsumerConfig{ConsumerName: name, ErrorHandler: func(_ OffsetConsumer, err error) {
+		if errors.Is(err, ErrStreamRecreated) {
+			reported.Store(true)
+		}
+	}})
+	recreateStream(t, js, numMessages+20) // passes the old position: only the identity tells
+	if err := c2.Consume(func(jetstream.Msg) {}); err != nil {
+		t.Fatal(err)
+	}
+	if !reported.Load() {
+		t.Fatal("ErrStreamRecreated not reported")
+	}
+	if got := c2.(*offsetConsumer).startSeq; got != 0 {
+		t.Fatalf("expected the offset reset to 0, got %d", got)
+	}
+}
+
+// Several starters taking over a dead owner all wake from the liveness wait
+// at the same moment (there is no jitter): the CAS against the revision read
+// before the wait lets exactly one of them win.
+func TestConcurrentTakeover(t *testing.T) {
+	withLivenessWait(t, 500*time.Millisecond)
+	srv := RunBasicJetStreamServer()
+	t.Cleanup(func() { shutdownJSServerAndRemoveStorage(t, srv) })
+	js := setupStream(t, srv.ClientURL())
+	name := fmt.Sprintf("c-%d", time.Now().UnixNano())
+	putOwnedEntry(t, js, name, "oc-dead-owner", 7)
+
+	const n = 4
+	consumers := make([]OffsetConsumer, n)
+	for i := range consumers {
+		consumers[i] = newTestConsumer(t, connect(t, srv.ClientURL()), ConsumerConfig{ConsumerName: name})
+	}
+	errs := make(chan error, n)
+	for _, c := range consumers {
+		go func() { errs <- c.Consume(func(jetstream.Msg) {}) }()
+	}
+	wins := 0
+	for i := 0; i < n; i++ {
+		err := <-errs
+		switch {
+		case err == nil:
+			wins++
+		case !errors.Is(err, ErrAlreadyInUse):
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+	if wins != 1 {
+		t.Fatalf("expected exactly one winner, got %d", wins)
+	}
+	if names := consumerNamesWithPrefix(t, js, "oc-"+testStream+"-"+name+"-"); len(names) != 1 {
+		t.Fatalf("expected only the winner's ordered consumer, got %v", names)
 	}
 }

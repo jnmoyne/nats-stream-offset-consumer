@@ -98,6 +98,14 @@ public class ConsumerConfig {
             return this;
         }
 
+        /**
+         * Where a new consumer (no stored offset) begins. Default: BEGINNING.
+         * END is resolved to the stream's last sequence when the consumer is
+         * created and that position is stored immediately, so messages
+         * published while the consumer is down are not skipped on the next
+         * start. It also applies when the stream is found to have been
+         * recreated (see {@link StreamRecreatedException}).
+         */
         public Builder startPosition(StartPosition startPosition) {
             if (startPosition == null) {
                 throw new IllegalArgumentException("startPosition must not be null");

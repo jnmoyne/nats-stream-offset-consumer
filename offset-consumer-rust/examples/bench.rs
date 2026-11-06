@@ -57,15 +57,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let count = Arc::new(AtomicU64::new(0));
     let bytes = Arc::new(AtomicU64::new(0));
     let commits = Arc::new(AtomicU64::new(0));
-    let last: Arc<Mutex<Option<JoinHandle<offset_consumer::errors::Result<()>>>>> = Arc::new(Mutex::new(None));
+    let last: Arc<Mutex<Option<JoinHandle<offset_consumer::errors::Result<()>>>>> =
+        Arc::new(Mutex::new(None));
     let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
     let done_tx = Arc::new(Mutex::new(Some(done_tx)));
     let handle = tokio::runtime::Handle::current();
     let recv_ns = Arc::new(AtomicU64::new(0));
     let recv_c = recv_ns.clone();
     let c = consumer.clone();
-    let (count_c, bytes_c, commits_c, last_c, done_c) =
-        (count.clone(), bytes.clone(), commits.clone(), last.clone(), done_tx.clone());
+    let (count_c, bytes_c, commits_c, last_c, done_c) = (
+        count.clone(),
+        bytes.clone(),
+        commits.clone(),
+        last.clone(),
+        done_tx.clone(),
+    );
     let mode_s = mode.to_string();
     let start = Instant::now();
 
@@ -79,10 +85,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if every > 0 && n % every == 0 {
                 // The handler is synchronous; commit through the runtime.
                 if mode_s == "sync" {
-                    tokio::task::block_in_place(|| handle.block_on(c.commit_sync())).expect("commit_sync");
+                    tokio::task::block_in_place(|| handle.block_on(c.commit_sync()))
+                        .expect("commit_sync");
                     commits_c.fetch_add(1, Ordering::Relaxed);
                 } else if mode_s == "async" {
-                    let h = tokio::task::block_in_place(|| handle.block_on(c.commit_async())).expect("commit_async");
+                    let h = tokio::task::block_in_place(|| handle.block_on(c.commit_async()))
+                        .expect("commit_async");
                     if let Some(prev) = last_c.lock().unwrap().replace(h) {
                         drop(prev); // the chain keeps running; only the last handle is awaited
                     }

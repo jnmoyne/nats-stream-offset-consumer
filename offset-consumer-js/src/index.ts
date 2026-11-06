@@ -1,4 +1,9 @@
-export { AlreadyInUseError, InvalidConsumerNameError } from "./errors.js";
+export {
+  AlreadyInUseError,
+  InvalidConsumerNameError,
+  InvalidStreamNameError,
+  StreamRecreatedError,
+} from "./errors.js";
 export type {
   ConsumerConfig,
   ConsumerMessages,

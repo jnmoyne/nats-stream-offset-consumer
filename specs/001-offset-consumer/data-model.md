@@ -36,15 +36,15 @@ The primary user-facing entity. Represents a logical consumer bound to a specifi
 
 **State transitions**:
 ```
-Created (claimed) → Consuming → Closed (consumer deleted, ownership released)
+Created → (claim) Consuming → Closed (consumer deleted, ownership released if claimed)
                        ↕
-                    Seeking (stop + delete consumer → write KV → restart under next generation)
+                    Seeking (stop delivery → write KV → start next generation → delete previous consumer)
 ```
 
-- `Created`: After construction — entry claimed, KV read, start sequence resolved, not yet consuming. Construction fails with AlreadyInUse if another live instance owns the entry.
-- `Consuming`: After `Consume()` — ordered consumer `{owner}-g{N}` active, messages being delivered.
-- `Seeking`: Transient — consumption stopped, ordered consumer deleted, KV updated, consumption restarted under `{owner}-g{N+1}`.
-- `Closed`: After `Close()` — pending commits drained (bounded; leftovers abandoned), ordered consumer deleted, entry written back with empty ownership and the highest requested position (or the last delivered one when auto-commit is on).
+- `Created`: After construction — KV read, start position resolved, nothing written. Construction fails with AlreadyInUse if the stored owner has a consumer. A seek here only records the position; commits do nothing.
+- `Consuming`: After `Consume()` — entry claimed (CAS, after a 5s liveness wait if the stored owner had no consumer), ordered consumer `{owner}-g{N}` active, messages being delivered.
+- `Seeking`: Transient — delivery stopped, KV updated, consumption restarted under `{owner}-g{N+1}`, then the `{owner}-g{N}` consumer deleted (make before break).
+- `Closed`: After `Close()` — pending commits drained (bounded; leftovers abandoned), ordered consumer deleted, entry written back with empty ownership and the highest requested position (or the last processed one when auto-commit is on). The write is a CAS on an entry that still names the instance; if another instance owns it, nothing is written and `Close` fails with AlreadyInUse; if it was deleted, nothing is written.
 
 ---
 
@@ -58,7 +58,7 @@ Created (claimed) → Consuming → Closed (consumer deleted, ownership released
 | `AutoCommitInterval` | duration | 5 seconds | Ignored when AutoCommit=false |
 | `FilterSubjects` | string list | nil/empty | Optional |
 | `ErrorHandler` | callback | nil | Optional (Rust: constructor argument) |
-| `StartPosition` | enum | Beginning | `Beginning` or `End` — only used when no stored offset exists |
+| `StartPosition` | enum | Beginning | `Beginning` or `End` — used when no stored offset exists or the stream was recreated; `End` is resolved to the stream's last sequence at construction and stored by the claim |
 | `InactiveThreshold` | duration | 30s | Go and JS only; Java uses the server default (5s), Rust a fixed 30s |
 
 ---
@@ -71,7 +71,7 @@ Created (claimed) → Consuming → Closed (consumer deleted, ownership released
 | `committed_at` | RFC3339 timestamp | Wall-clock time of the commit |
 | `owner` | string | Owner prefix `oc-{stream}-{consumer}-{nuid}` of the live instance; empty when unowned |
 | `host` | string | Hostname of the owning instance |
-| `claimed_at` | RFC3339 timestamp | When the owner claimed the entry |
+| `stream_created` | decimal string | Stream creation time in Unix nanoseconds: the stream incarnation `seq` belongs to. Absent in 1.0/1.1 entries |
 
 **JSON representation**:
 ```json
@@ -80,19 +80,19 @@ Created (claimed) → Consuming → Closed (consumer deleted, ownership released
   "committed_at": "2026-02-25T10:45:00Z",
   "owner": "oc-orders-billing-service-4TzEx8Gq1Wq7Lx5kX9",
   "host": "billing-7",
-  "claimed_at": "2026-02-25T10:40:00Z"
+  "stream_created": "1772016000123456789"
 }
 ```
 
 **KV key**: `{stream-name}.{consumer-name}` (e.g., `orders.billing-service`)
 
-**Writes**: the claim at construction is a compare-and-set (create if absent, update by revision otherwise). Commits, seeks and the release on close are plain puts. Readers treat missing ownership fields (version 1.0 entries) as unowned.
+**Writes**: the claim at construction is a compare-and-set (create if absent, update by revision otherwise). Commits, seeks and the release on close are plain puts. Readers treat missing ownership fields (version 1.0 entries) as unowned. An entry is from an earlier stream incarnation when both `stream_created` values are present and differ, or, without a stored identity, when `seq` exceeds the stream's last sequence; its offset is then reset to the start position.
 
 ---
 
 ### 4. OffsetConsumerInfo
 
-Returned by `Info()` and `ListConsumers()`: `seq`, `committedAt`, `owner`, `host`, `claimedAt` (the entry's fields, as read).
+Returned by `Info()` and `ListConsumers()`: `seq`, `committedAt`, `owner`, `host`, `claimedAt`, `streamCreated` (the entry's fields, as read).
 
 ---
 
@@ -112,13 +112,16 @@ Language-native: Go `jetstream.PubAckFuture` (wrapped so `Ok()` fires only after
 | Delete-marker TTL | 10 minutes (all ports; requires nats-server 2.11+) |
 | TTL | None (offsets persist indefinitely) |
 
-**Creation logic**: Create if not exists; use as-is if exists.
+**Creation logic**: open; create only if missing; never overwrite an existing configuration. Raise (never lower) the replica count to the target stream's, best effort.
 
 ---
 
 ### 7. Ordered consumer names
 
-`{owner}-g{generation}` + client suffix: Go/JS `_{serial}` (serial increments on each client-side reset), Java `-{NUID}` (new NUID per reset), Rust none at first then `_{n}` per reset. The ownership check matches `name.startsWith(owner)`.
+Stream and consumer names: `^[A-Za-z0-9_=-]+$`, at most 196 characters together.
+
+
+Ordered consumers: `{owner}-g{generation}` + client suffix: Go/JS `_{serial}` (serial increments on each client-side reset), Java `-{NUID}` (new NUID per reset), Rust none at first then `_{n}` per reset. The ownership check treats the owner as alive while a name matches `name.startsWith(owner)`, checked again after a 5s liveness wait before a takeover.
 
 ---
 
@@ -137,7 +140,7 @@ ConsumerConfig ──1:1──▶ OffsetConsumer ──1:1──▶ OffsetEntry 
 
 | Error | Language | Description |
 |---|---|---|
-| `ErrAlreadyInUse` / `*AlreadyInUseError{Owner, Host, ClaimedAt}` | Go | Another live instance owns the entry (returned by `NewConsumer`) |
+| `ErrAlreadyInUse` / `*AlreadyInUseError{Owner, Host}` | Go | Another live instance owns the entry (returned by `NewConsumer` and `Consume`; by `Close` when the release is skipped) |
 | `ErrConsumerClosed` | Go | Operation attempted on a closed consumer |
 | `ErrInvalidConsumerName` | Go | Consumer name empty or contains `.` |
 | `ErrAlreadyConsuming` | Go | `Consume` called twice |
@@ -145,5 +148,5 @@ ConsumerConfig ──1:1──▶ OffsetConsumer ──1:1──▶ OffsetEntry 
 | `CommitException` | Java | Commit/seek write failure (also the failure of `commitAsync` futures) |
 | `AlreadyInUseError` | JS/TS | Thrown by `createConsumer` |
 | `InvalidConsumerNameError` | JS/TS | Consumer name validation |
-| `OffsetConsumerError::AlreadyInUse { owner, host, claimed_at }` | Rust | Returned by `OffsetConsumer::new` |
+| `OffsetConsumerError::AlreadyInUse { owner, host }` | Rust | Returned by `OffsetConsumer::new`, `consume` and `close` |
 | `OffsetConsumerError::{InvalidConsumerName, StreamRequired, ConsumerClosed, AlreadyConsuming, Nats, Other}` | Rust | Other errors |

@@ -6,7 +6,10 @@ pub enum StartPosition {
     /// Start from the first message in the stream.
     #[default]
     Beginning,
-    /// Start from only new messages published after the consumer starts.
+    /// Start after the stream's last message at the time the consumer is
+    /// created. The claim at the first `consume()` stores that position, so
+    /// messages published while the consumer is down are not skipped on the
+    /// next start.
     End,
 }
 
@@ -17,7 +20,9 @@ pub struct ConsumerConfig {
     pub stream: String,
 
     /// Logical name for this consumer. Required.
-    /// Must not be empty. Must not contain '.'.
+    /// Letters, digits, '-', '_' and '=' only; the stream and consumer names
+    /// together must not exceed 196 characters (the server limits consumer
+    /// names to 255, and the ordered consumer names embed both).
     /// Together with stream forms the KV key: "{stream}.{consumer_name}".
     pub consumer_name: String,
 
@@ -32,7 +37,11 @@ pub struct ConsumerConfig {
     pub filter_subjects: Vec<String>,
 
     /// Controls where a new consumer (no stored offset) begins.
-    /// Default: Beginning (sequence 1).
+    /// Default: Beginning (sequence 1). `End` is resolved to the stream's last
+    /// sequence when the consumer is created and stored by the claim at the
+    /// first `consume()`. It also
+    /// applies when the stream is found to have been recreated (see
+    /// `OffsetConsumerError::StreamRecreated`).
     pub start_position: StartPosition,
 }
 

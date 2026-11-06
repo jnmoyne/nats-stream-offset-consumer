@@ -3,10 +3,16 @@ package offsetconsumer
 import (
 	"os"
 	"testing"
+	"time"
 
 	"github.com/nats-io/nats-server/v2/server"
 	natsserver "github.com/nats-io/nats-server/v2/test"
 )
+
+func init() {
+	// Keep the takeover wait short in tests; tests of the wait set it explicitly.
+	livenessWait = 300 * time.Millisecond
+}
 
 func RunBasicJetStreamServer() *server.Server {
 	opts := natsserver.DefaultTestOptions

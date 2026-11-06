@@ -1,22 +1,22 @@
 package io.synadia.offsetconsumer;
 
 /**
- * Thrown by {@link OffsetConsumerFactory#create} when the offset entry for the
- * stream and consumer name is owned by another live instance: either its
- * ordered consumer still exists on the server, or its claim is too recent.
+ * Thrown by {@link OffsetConsumerFactory#create} and {@link OffsetConsumer#consume}
+ * when the offset entry for the stream and consumer name is owned by another
+ * live instance: a consumer whose name starts with its owner prefix exists on
+ * the stream (at consume(), also after the liveness wait), or another instance
+ * wrote the entry while this one was claiming it.
  */
 public class AlreadyInUseException extends Exception {
 
     private final String owner;
     private final String host;
-    private final String claimedAt;
 
-    public AlreadyInUseException(String owner, String host, String claimedAt) {
+    public AlreadyInUseException(String owner, String host) {
         super("Offset consumer already in use by another instance (owner \"" + owner
-                + "\" on host \"" + host + "\", claimed at " + claimedAt + ")");
+                + "\" on host \"" + host + "\")");
         this.owner = owner;
         this.host = host;
-        this.claimedAt = claimedAt;
     }
 
     /**
@@ -32,12 +32,5 @@ public class AlreadyInUseException extends Exception {
      */
     public String getHost() {
         return host;
-    }
-
-    /**
-     * Returns the RFC3339 timestamp at which the owner claimed the entry.
-     */
-    public String getClaimedAt() {
-        return claimedAt;
     }
 }

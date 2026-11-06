@@ -10,14 +10,18 @@ public final class OffsetConsumerInfo {
     private final String committedAt;
     private final String owner;
     private final String host;
-    private final String claimedAt;
+    private final String streamCreated;
 
-    public OffsetConsumerInfo(long seq, String committedAt, String owner, String host, String claimedAt) {
+    public OffsetConsumerInfo(long seq, String committedAt, String owner, String host) {
+        this(seq, committedAt, owner, host, "");
+    }
+
+    public OffsetConsumerInfo(long seq, String committedAt, String owner, String host, String streamCreated) {
         this.seq = seq;
         this.committedAt = committedAt == null ? "" : committedAt;
         this.owner = owner == null ? "" : owner;
         this.host = host == null ? "" : host;
-        this.claimedAt = claimedAt == null ? "" : claimedAt;
+        this.streamCreated = streamCreated == null ? "" : streamCreated;
     }
 
     /**
@@ -51,15 +55,17 @@ public final class OffsetConsumerInfo {
     }
 
     /**
-     * Returns the timestamp at which the owner claimed the entry (RFC3339/ISO-8601), or an empty string.
+     * Returns the identity of the stream incarnation the offset refers to: the
+     * stream's creation time in Unix nanoseconds, as a decimal string. Empty
+     * for entries written by older versions.
      */
-    public String getClaimedAt() {
-        return claimedAt;
+    public String getStreamCreated() {
+        return streamCreated;
     }
 
     @Override
     public String toString() {
         return "OffsetConsumerInfo{seq=" + seq + ", committedAt='" + committedAt + "', owner='" + owner
-                + "', host='" + host + "', claimedAt='" + claimedAt + "'}";
+                + "', host='" + host + "', streamCreated='" + streamCreated + "'}";
     }
 }
