@@ -1,64 +1,89 @@
 package io.synadia.offsetconsumer;
 
-import io.nats.client.Connection;
 import io.nats.client.JetStreamApiException;
 import io.nats.client.KeyValue;
 import io.nats.client.MessageConsumer;
 import io.nats.client.MessageHandler;
+import io.nats.client.OrderedConsumerContext;
 import io.nats.client.StreamContext;
 import io.nats.client.api.DeliverPolicy;
+import io.nats.client.api.KeyValueEntry;
 import io.nats.client.api.OrderedConsumerConfiguration;
 import io.nats.client.api.StreamInfo;
 
 import java.io.IOException;
 import java.time.Instant;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
 /**
  * Package-private implementation of OffsetConsumer.
- * All public methods are thread-safe using synchronized blocks on the lock object.
+ * <p>
+ * State is guarded by {@code lock}. KV writes (commits, seeks) are executed on a
+ * single-thread {@code commitExecutor}, which keeps them in program order; their
+ * submission is serialized by {@code submitLock} (lock order: submitLock, then lock).
  */
 class OffsetConsumerImpl implements OffsetConsumer {
 
-    private final Connection nc;
+    /** Bound on how long close() waits for pending commits. Not final so tests can shorten it. */
+    static volatile long closeTimeoutMillis = 5000;
+
     private final ConsumerConfig config;
     private final StreamContext streamContext;
     private final KeyValue kv;
     private final String kvKey;
-    private final Object lock = new Object();
+    private final String owner;
+    private final String host;
+    private final String claimedAt;
 
-    private long lastRevision;
+    private final Object lock = new Object();
+    private final Object submitLock = new Object();
+    private final ExecutorService commitExecutor;
+
     private long startSeq;
     private long lastDeliveredSeq;
     private long lastCommittedSeq;
+    private String lastCommittedAt;
+    /** Highest sequence handed to a commit call; the release write persists at least this. */
+    private long lastRequestedSeq;
+    private String lastRequestedAt;
+    /** Set by close() once the bounded wait expired: queued commits complete without writing. */
+    private volatile boolean abandonPending;
+    private int generation;
     private MessageConsumer messageConsumer;
+    private OrderedConsumerContext orderedConsumer;
     private MessageHandler currentHandler;
-    private boolean asyncCommitInFlight;
     private ScheduledExecutorService autoCommitScheduler;
     private boolean closed;
+    private boolean kvDeleted;
 
     /**
      * Package-private constructor. Use OffsetConsumerFactory.create() to obtain instances.
      */
-    OffsetConsumerImpl(Connection nc, ConsumerConfig config, StreamContext streamContext,
-                       KeyValue kv, String kvKey, long lastRevision, long startSeq) {
-        this.nc = nc;
+    OffsetConsumerImpl(ConsumerConfig config, StreamContext streamContext, KeyValue kv, String kvKey, OffsetEntry claimed) {
         this.config = config;
         this.streamContext = streamContext;
         this.kv = kv;
         this.kvKey = kvKey;
-        this.lastRevision = lastRevision;
-        this.startSeq = startSeq;
-
-        // If we have a stored offset, initialize delivered and committed to match
-        if (startSeq > 0) {
-            this.lastDeliveredSeq = startSeq;
-            this.lastCommittedSeq = startSeq;
-        }
+        this.owner = claimed.getOwner();
+        this.host = claimed.getHost();
+        this.claimedAt = claimed.getClaimedAt();
+        this.startSeq = claimed.getSeq();
+        this.lastDeliveredSeq = claimed.getSeq();
+        this.lastCommittedSeq = claimed.getSeq();
+        this.lastCommittedAt = claimed.getCommittedAt();
+        this.lastRequestedSeq = claimed.getSeq();
+        this.lastRequestedAt = claimed.getCommittedAt();
+        this.commitExecutor = Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "offset-consumer-commit");
+            t.setDaemon(true);
+            return t;
+        });
     }
 
     @Override
@@ -73,7 +98,6 @@ class OffsetConsumerImpl implements OffsetConsumer {
 
             startConsuming(handler);
 
-            // Start auto-commit scheduler if enabled
             if (config.isAutoCommit() && autoCommitScheduler == null) {
                 autoCommitScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
                     Thread t = new Thread(r, "offset-consumer-autocommit");
@@ -81,23 +105,38 @@ class OffsetConsumerImpl implements OffsetConsumer {
                     return t;
                 });
                 long intervalMs = config.getAutoCommitInterval().toMillis();
-                autoCommitScheduler.scheduleAtFixedRate(() -> {
-                    try {
-                        commitSync();
-                    } catch (Exception e) {
-                        // Best effort — swallow auto-commit errors
-                    }
-                }, intervalMs, intervalMs, TimeUnit.MILLISECONDS);
+                autoCommitScheduler.scheduleAtFixedRate(this::autoCommit, intervalMs, intervalMs, TimeUnit.MILLISECONDS);
+            }
+        }
+    }
+
+    private void autoCommit() {
+        synchronized (lock) {
+            if (closed || lastDeliveredSeq <= lastCommittedSeq) {
+                return;
+            }
+        }
+        try {
+            commitSync();
+        } catch (Exception e) {
+            boolean report;
+            synchronized (lock) {
+                report = !closed;
+            }
+            if (report && config.getErrorHandler() != null) {
+                config.getErrorHandler().onError(this, e);
             }
         }
     }
 
     /**
-     * Creates an ordered consumer and starts delivering messages.
-     * Must be called while holding the lock.
+     * Creates an ordered consumer under a new generation prefix and starts
+     * delivering messages. Must be called while holding the lock.
      */
     private void startConsuming(MessageHandler handler) throws IOException, JetStreamApiException {
-        OrderedConsumerConfiguration occ = new OrderedConsumerConfiguration();
+        generation++;
+        OrderedConsumerConfiguration occ = new OrderedConsumerConfiguration()
+                .consumerNamePrefix(owner + "-g" + generation);
 
         if (startSeq > 0) {
             occ.deliverPolicy(DeliverPolicy.ByStartSequence);
@@ -112,122 +151,178 @@ class OffsetConsumerImpl implements OffsetConsumer {
             occ.filterSubjects(config.getFilterSubjects().toArray(new String[0]));
         }
 
-        io.nats.client.OrderedConsumerContext orderedConsumer = streamContext.createOrderedConsumer(occ);
-
-        messageConsumer = orderedConsumer.consume(msg -> {
+        OrderedConsumerContext ctx = streamContext.createOrderedConsumer(occ);
+        MessageConsumer mc = ctx.consume(msg -> {
             synchronized (lock) {
                 lastDeliveredSeq = msg.metaData().streamSequence();
             }
             handler.onMessage(msg);
         });
 
+        messageConsumer = mc;
+        orderedConsumer = ctx;
         currentHandler = handler;
+    }
+
+    /**
+     * Stops delivery and deletes the ordered consumer from the server so that
+     * ownership is visibly released. Best effort. Call without holding the lock.
+     */
+    private void stopOrderedConsumer(MessageConsumer mc, OrderedConsumerContext ctx) {
+        if (mc != null) {
+            try {
+                mc.close();
+            } catch (Exception ignored) {
+                // best effort
+            }
+        }
+        if (ctx != null) {
+            String name = ctx.getConsumerName();
+            if (name != null && !name.isEmpty()) {
+                try {
+                    streamContext.deleteConsumer(name);
+                } catch (Exception ignored) {
+                    // best effort (already gone, or connection down)
+                }
+            }
+        }
+    }
+
+    private OffsetEntry entryFor(long seq, String committedAt) {
+        return new OffsetEntry(seq, committedAt, owner, host, claimedAt);
     }
 
     @Override
     public void commitSync() throws CommitException {
-        long seq;
-        long lastRev;
-
-        synchronized (lock) {
-            if (closed) {
-                throw new CommitException("Consumer is closed");
-            }
-            seq = lastDeliveredSeq;
-            lastRev = lastRevision;
-        }
-
-        if (seq == 0) {
-            return; // nothing to commit
-        }
-
-        String json = String.format("{\"seq\":%d,\"committed_at\":\"%s\"}", seq, Instant.now().toString());
-        byte[] data = json.getBytes();
-
         try {
-            long newRev = kvUpdate(data, lastRev);
-            synchronized (lock) {
-                lastRevision = newRev;
-                lastCommittedSeq = seq;
+            commitAsync().get();
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof CommitException) {
+                throw (CommitException) cause;
             }
-        } catch (CASConflictException e) {
-            throw e;
-        } catch (Exception e) {
-            throw new CommitException("Failed to commit offset", e);
+            throw new CommitException("Failed to commit offset", cause);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new CommitException("Interrupted while committing offset", e);
         }
     }
 
     @Override
-    public CompletableFuture<Void> commitAsync() throws AsyncCommitInFlightException {
-        synchronized (lock) {
-            if (asyncCommitInFlight) {
-                throw new AsyncCommitInFlightException();
-            }
-            asyncCommitInFlight = true;
-        }
-
-        return CompletableFuture.supplyAsync(() -> {
-            try {
-                commitSync();
-                return null;
-            } catch (Exception e) {
-                throw new CompletionException(e);
-            } finally {
-                synchronized (lock) {
-                    asyncCommitInFlight = false;
+    public CompletableFuture<Void> commitAsync() {
+        synchronized (submitLock) {
+            long seq;
+            String at = Instant.now().toString();
+            synchronized (lock) {
+                if (closed) {
+                    return failed(new CommitException("Consumer is closed"));
+                }
+                seq = lastDeliveredSeq;
+                if (seq > lastRequestedSeq) {
+                    lastRequestedSeq = seq;
+                    lastRequestedAt = at;
                 }
             }
-        });
+            if (seq == 0) {
+                return CompletableFuture.completedFuture(null);
+            }
+            return submit(seq, at);
+        }
+    }
+
+    /**
+     * Queues the write of seq on the commit pipeline. Must be called while holding submitLock.
+     */
+    private CompletableFuture<Void> submit(long seq, String committedAt) {
+        CompletableFuture<Void> future = new CompletableFuture<>();
+        byte[] data = entryFor(seq, committedAt).toJson();
+        try {
+            commitExecutor.execute(() -> {
+                if (abandonPending) {
+                    // close() gave up waiting: the release write persists this position.
+                    future.complete(null);
+                    return;
+                }
+                try {
+                    kv.put(kvKey, data);
+                    synchronized (lock) {
+                        if (seq > lastCommittedSeq) {
+                            lastCommittedSeq = seq;
+                            lastCommittedAt = committedAt;
+                        }
+                    }
+                    future.complete(null);
+                } catch (Exception e) {
+                    future.completeExceptionally(new CommitException("Failed to commit offset", e));
+                }
+            });
+        } catch (RejectedExecutionException e) {
+            future.completeExceptionally(new CommitException("Consumer is closed", e));
+        }
+        return future;
+    }
+
+    private static CompletableFuture<Void> failed(Throwable t) {
+        CompletableFuture<Void> f = new CompletableFuture<>();
+        f.completeExceptionally(t);
+        return f;
     }
 
     @Override
     public void seek(long seq) throws CommitException, IOException, JetStreamApiException {
         MessageConsumer mc;
+        OrderedConsumerContext ctx;
         MessageHandler handler;
-        long lastRev;
 
         synchronized (lock) {
             if (closed) {
                 throw new IllegalStateException("Consumer is closed");
             }
-
             mc = messageConsumer;
+            ctx = orderedConsumer;
             messageConsumer = null;
+            orderedConsumer = null;
             handler = currentHandler;
-            lastRev = lastRevision;
         }
 
-        // Stop current consumption
-        if (mc != null) {
+        stopOrderedConsumer(mc, ctx);
+
+        // Write the new position through the commit pipeline, holding submitLock
+        // so that no commit can be queued between the write and the state update.
+        String at = Instant.now().toString();
+        byte[] data = entryFor(seq, at).toJson();
+        synchronized (submitLock) {
+            CompletableFuture<Void> write = new CompletableFuture<>();
             try {
-                mc.stop();
-            } catch (Exception e) {
-                // best effort
+                commitExecutor.execute(() -> {
+                    try {
+                        kv.put(kvKey, data);
+                        write.complete(null);
+                    } catch (Exception e) {
+                        write.completeExceptionally(e);
+                    }
+                });
+                write.get();
+            } catch (ExecutionException e) {
+                throw new CommitException("Failed to persist seek offset", e.getCause());
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new CommitException("Interrupted while seeking", e);
+            } catch (RejectedExecutionException e) {
+                throw new CommitException("Consumer is closed", e);
+            }
+            synchronized (lock) {
+                startSeq = seq;
+                lastDeliveredSeq = seq;
+                lastCommittedSeq = seq;
+                lastCommittedAt = at;
+                lastRequestedSeq = seq;
+                lastRequestedAt = at;
             }
         }
 
-        // Persist new offset via CAS
-        String json = String.format("{\"seq\":%d,\"committed_at\":\"%s\"}", seq, Instant.now().toString());
-        byte[] data = json.getBytes();
-
-        long newRev;
-        try {
-            newRev = kvUpdate(data, lastRev);
-        } catch (CASConflictException e) {
-            // Consumer left stopped on CAS failure
-            throw e;
-        } catch (Exception e) {
-            throw new CommitException("Failed to persist seek offset", e);
-        }
-
-        // Update internal state and restart consumption
         synchronized (lock) {
-            lastRevision = newRev;
-            startSeq = seq;
-            lastDeliveredSeq = seq;
-            lastCommittedSeq = seq;
-
-            if (handler != null) {
+            if (handler != null && !closed) {
                 startConsuming(handler);
             }
         }
@@ -240,31 +335,32 @@ class OffsetConsumerImpl implements OffsetConsumer {
 
     @Override
     public void seekToEnd() throws CommitException, IOException, JetStreamApiException {
-        try {
-            StreamInfo info = streamContext.getStreamInfo();
-            long lastSeq = info.getStreamState().getLastSequence();
-            seek(lastSeq);
-        } catch (CommitException | JetStreamApiException e) {
-            throw e;
-        } catch (IOException e) {
-            throw e;
+        StreamInfo info = streamContext.getStreamInfo();
+        seek(info.getStreamState().getLastSequence());
+    }
+
+    @Override
+    public OffsetConsumerInfo info() throws IOException, JetStreamApiException {
+        KeyValueEntry entry = kv.get(kvKey);
+        if (entry == null) {
+            return null;
         }
+        return OffsetEntry.fromJson(entry.getValue()).toInfo();
     }
 
     @Override
     public void deleteConsumer() throws IOException, JetStreamApiException {
-        kv.delete(kvKey);
+        synchronized (submitLock) {
+            kv.delete(kvKey);
+        }
         synchronized (lock) {
-            lastRevision = 0;
+            kvDeleted = true;
         }
     }
 
     @Override
     public void close() {
         ScheduledExecutorService scheduler;
-        MessageConsumer mc;
-        boolean needsFinalCommit;
-
         synchronized (lock) {
             if (closed) {
                 return;
@@ -272,93 +368,75 @@ class OffsetConsumerImpl implements OffsetConsumer {
             closed = true;
             scheduler = autoCommitScheduler;
             autoCommitScheduler = null;
-            mc = messageConsumer;
-            messageConsumer = null;
-            needsFinalCommit = config.isAutoCommit() && lastDeliveredSeq > lastCommittedSeq;
         }
 
-        // Shut down auto-commit scheduler
+        // Stop the auto-commit timer, then drain pending commits (bounded).
+        // Commits still queued after the wait are abandoned: the release write
+        // below persists the highest requested position anyway.
         if (scheduler != null) {
             scheduler.shutdown();
-            try {
-                scheduler.awaitTermination(5, TimeUnit.SECONDS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
+            awaitTermination(scheduler);
+        }
+        commitExecutor.shutdown();
+        if (!awaitTermination(commitExecutor)) {
+            abandonPending = true;
+            awaitTermination(commitExecutor);
         }
 
-        // Stop the message consumer
-        if (mc != null) {
-            try {
-                mc.stop();
-            } catch (Exception e) {
-                // best effort
-            }
-        }
-
-        // Final commit if auto-commit enabled and there are uncommitted messages
-        if (needsFinalCommit) {
-            try {
-                commitSyncInternal();
-            } catch (Exception e) {
-                // best effort — swallow exceptions on final commit
-            }
-        }
-    }
-
-    /**
-     * Internal commit that does not check the closed flag.
-     * Used during close() for the final commit.
-     */
-    private void commitSyncInternal() throws CommitException {
-        long seq;
-        long lastRev;
-
+        // Stop delivery and delete the ordered consumer.
+        MessageConsumer mc;
+        OrderedConsumerContext ctx;
         synchronized (lock) {
-            seq = lastDeliveredSeq;
-            lastRev = lastRevision;
+            mc = messageConsumer;
+            ctx = orderedConsumer;
+            messageConsumer = null;
+            orderedConsumer = null;
         }
+        stopOrderedConsumer(mc, ctx);
 
-        if (seq == 0) {
+        // Release ownership with one final write. It persists the highest
+        // position handed to a commit call (acknowledged or not) and, with
+        // auto-commit, any uncommitted messages.
+        long seq;
+        String at;
+        boolean deleted;
+        synchronized (lock) {
+            seq = lastCommittedSeq;
+            at = lastCommittedAt;
+            if (lastRequestedSeq > seq) {
+                seq = lastRequestedSeq;
+                at = lastRequestedAt;
+            }
+            if (config.isAutoCommit() && lastDeliveredSeq > seq) {
+                seq = lastDeliveredSeq;
+                at = Instant.now().toString();
+            }
+            deleted = kvDeleted;
+        }
+        if (deleted) {
             return;
         }
-
-        String json = String.format("{\"seq\":%d,\"committed_at\":\"%s\"}", seq, Instant.now().toString());
-        byte[] data = json.getBytes();
-
         try {
-            long newRev = kvUpdate(data, lastRev);
+            kv.put(kvKey, new OffsetEntry(seq, at, "", "", "").toJson());
             synchronized (lock) {
-                lastRevision = newRev;
-                lastCommittedSeq = seq;
+                if (seq > lastCommittedSeq) {
+                    lastCommittedSeq = seq;
+                    lastCommittedAt = at;
+                }
             }
-        } catch (CASConflictException e) {
-            throw e;
         } catch (Exception e) {
-            throw new CommitException("Failed to commit offset", e);
+            if (config.getErrorHandler() != null) {
+                config.getErrorHandler().onError(this, new CommitException("Failed to release offset entry on close", e));
+            }
         }
     }
 
-    /**
-     * Performs a CAS update on the KV store. If lastRev is 0, creates the key;
-     * otherwise updates with the expected revision.
-     *
-     * @return the new revision
-     * @throws CASConflictException if the revision does not match
-     */
-    private long kvUpdate(byte[] value, long lastRev) throws Exception {
+    private static boolean awaitTermination(ExecutorService executor) {
         try {
-            if (lastRev == 0) {
-                return kv.create(kvKey, value);
-            } else {
-                return kv.update(kvKey, value, lastRev);
-            }
-        } catch (JetStreamApiException e) {
-            // Error code 10071 = wrong last sequence (CAS conflict)
-            if (e.getApiErrorCode() == 10071) {
-                throw new CASConflictException(e);
-            }
-            throw e;
+            return executor.awaitTermination(closeTimeoutMillis, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
         }
     }
 }

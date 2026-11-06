@@ -21,14 +21,14 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@nats-io/jetstream": "^3.3.0",
-    "@nats-io/kv": "^3.3.0"
+    "@nats-io/jetstream": "^3.4.0",
+    "@nats-io/kv": "^3.4.0"
   },
   "peerDependencies": {
-    "@nats-io/nats-core": "^3.3.0"
+    "@nats-io/nats-core": "^3.4.0"
   },
   "devDependencies": {
-    "@nats-io/transport-node": "^3.3.1",
+    "@nats-io/transport-node": "^3.4.0",
     "tsup": "^8.0.0",
     "typescript": "^5.4.0",
     "vitest": "^3.0.0"

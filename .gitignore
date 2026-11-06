@@ -1,0 +1,18 @@
+# OS / IDE
+.DS_Store
+.idea/
+*.iml
+
+# Java
+offset-consumer-java/build/
+offset-consumer-java/.gradle/
+
+# JS/TS
+offset-consumer-js/node_modules/
+offset-consumer-js/dist/
+
+# Rust
+offset-consumer-rust/target/
+
+# Benchmark artifacts
+bench/.bench-go

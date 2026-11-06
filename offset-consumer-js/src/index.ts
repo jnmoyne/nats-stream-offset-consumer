@@ -1,12 +1,9 @@
-export {
-  CASConflictError,
-  AsyncCommitInFlightError,
-  InvalidConsumerNameError,
-} from "./errors.js";
+export { AlreadyInUseError, InvalidConsumerNameError } from "./errors.js";
 export type {
   ConsumerConfig,
   ConsumerMessages,
   OffsetConsumer,
+  OffsetConsumerInfo,
   StartPosition,
 } from "./types.js";
-export { createConsumer } from "./consumer.js";
+export { createConsumer, listConsumers } from "./consumer.js";

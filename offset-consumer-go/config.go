@@ -34,13 +34,24 @@ type ConsumerConfig struct {
 	FilterSubjects []string
 
 	// ErrorHandler is called when a terminal error occurs on the underlying
-	// ordered consumer. Receives a reference to the OffsetConsumer and the error.
-	// If nil and a terminal error occurs, consumption stops silently.
+	// ordered consumer, or when an auto-commit fails. Receives a reference to
+	// the OffsetConsumer and the error. If nil, such errors are dropped.
 	ErrorHandler func(OffsetConsumer, error)
 
 	// StartPosition controls where a new consumer (no stored offset) begins.
 	// Default: StartPositionBeginning (sequence 1).
 	StartPosition StartPosition
+
+	// InactiveThreshold is the server-side inactivity threshold of the
+	// underlying ephemeral ordered consumer. After an instance crashes, its
+	// ordered consumer (and with it the ownership of the offset entry) is
+	// released by the server once this threshold elapses. It is also the
+	// grace window during which a fresh ownership claim is considered alive
+	// even if its ordered consumer has not been created yet. Default: 30s.
+	InactiveThreshold time.Duration
 }
 
-const defaultAutoCommitInterval = 5 * time.Second
+const (
+	defaultAutoCommitInterval = 5 * time.Second
+	defaultInactiveThreshold  = 30 * time.Second
+)

@@ -5,7 +5,9 @@
 
 **Tests**: Not explicitly requested in the feature specification. Test tasks are omitted.
 
-**Organization**: Tasks are grouped by user story to enable independent implementation and testing. Each language (Go, Java, .NET, JS/TS) is implemented in its own directory and tasks across languages are parallelizable.
+**Organization**: Tasks are grouped by user story to enable independent implementation and testing. Each language (Go, Java, JS/TS, Rust) is implemented in its own directory and tasks across languages are parallelizable.
+
+**Revision 2026-11-06**: Phases 1-8 describe the original CAS-based design. Phase 9 replaced per-commit CAS with the startup ownership claim, removed the .NET port (its tasks below are obsolete) and added the Rust port; the current design is in `spec.md`, `data-model.md` and `contracts/`.
 
 ## Format: `[ID] [P?] [Story] Description`
 
@@ -17,7 +19,7 @@
 
 - **Go**: `offset-consumer-go/`
 - **Java**: `offset-consumer-java/src/main/java/io/synadia/offsetconsumer/`
-- **.NET**: `offset-consumer-dotnet/src/Synadia.OffsetConsumer/`
+- **Rust**: `offset-consumer-rust/src/`
 - **JS/TS**: `offset-consumer-js/src/`
 
 ---
@@ -335,3 +337,57 @@ With multiple developers:
 - All four languages share the same KV bucket format (`offset-consumers`) and key schema (`{stream}.{consumerName}`)
 - Commit after each task or logical group
 - Stop at any checkpoint to validate story independently
+
+---
+
+## Phase 9: Ownership Claim, Pipelined Commits, Client Upgrades (2026-11-06)
+
+**Purpose**: Enforce single-active-consumer at startup without per-commit CAS; fix the review findings; align all ports with Go; drop .NET; add Rust.
+
+### Design
+
+- [x] T100 Replace per-commit CAS with plain KV puts; keep one CAS write for the ownership claim at construction (spec §2.4, §2.5)
+- [x] T101 Extend the KV value with `owner`, `host`, `claimed_at`; readers tolerate their absence (data-model.md §3)
+- [x] T102 Name every ordered consumer `{owner}-g{generation}` with `owner = oc-{stream}-{consumer}-{nuid}`; check liveness by listing the stream's consumer names
+- [x] T103 Close: wait for pending commits (5s bound), delete the ordered consumer, single release write (final commit when auto-commit is on), skipped after DeleteConsumer
+- [x] T104 Seek: delete the previous ordered consumer, write, restart under the next generation; commit epoch so older acks do not move the position
+
+### Go (`offset-consumer-go/`)
+
+- [x] T110 Upgrade to nats.go v1.55.0 / nats-server v2.15.2 (go 1.26) in `go.mod`
+- [x] T111 `kv.go`: `offsetEntry` with ownership fields, `readEntry`, `claimEntry` (create/update, `ErrKeyExists`/`ErrKeyRevisionMismatch` → claim conflict), `isOwnerAlive`, `kvPutSubject` (API prefix/domain/mirror aware), `ListConsumers` with ownership fields
+- [x] T112 `consumer_impl.go`: claim flow in `NewConsumer`, `AlreadyInUseError`, `NamePrefix`/`InactiveThreshold` on the ordered consumer, pipelined `CommitAsync` with own in-flight tracking and ack-time position update, completed future when nothing to commit, `CommitSync` as async+wait, `Close` per T103
+- [x] T113 `config.go` `InactiveThreshold` (default 30s); `errors.go` `ErrAlreadyInUse`
+- [x] T114 Tests: replace the in-flight test with chained commits; add nothing-to-commit, owner fields, refused second instance, release on close, crash recovery (2s threshold), seek generation; `go test -race` clean
+
+### Java (`offset-consumer-java/`)
+
+- [x] T120 Upgrade to jnats 2.26.4 and jnats-server-runner 4.0.2 (`io.nats.NatsServerRunner`, `getNatsLocalhostUri()`)
+- [x] T121 `OffsetEntry.java` (JSON via `JsonParser`/`Encoding`), `AlreadyInUseException.java`, `OffsetConsumerInfo` ownership fields; delete `CASConflictException`, `AsyncCommitInFlightException`
+- [x] T122 `OffsetConsumerFactory.create`: claim flow (grace 5s = server ephemeral default; `getConsumerNames` liveness; `create`/`update` claim with 10071/10164 → `AlreadyInUseException`); `listConsumers` only treats 10059 as "no bucket"
+- [x] T123 `OffsetConsumerImpl`: single-thread commit executor (no KV I/O under the lock), `consumerNamePrefix(owner-gN)`, `MessageConsumer.close()` + `deleteConsumer(name)` on seek/close, release write on close
+- [x] T124 Tests: same scenario set as Go (crash recovery ~6s)
+
+### JS/TS (`offset-consumer-js/`)
+
+- [x] T130 Upgrade `@nats-io/jetstream`, `@nats-io/kv`, `@nats-io/nats-core` (peer), `@nats-io/transport-node` (dev) to 3.4.0
+- [x] T131 `kv.ts`: `OffsetEntry` with ownership fields, `readEntry` (DEL/PURGE = absent), `claimEntry` (10071/10164 → conflict); remove `casUpdate`
+- [x] T132 `consumer.ts`: claim flow, `name_prefix`/`inactive_threshold`, re-apply the threshold on `ordered_consumer_recreated`, chained plain-put commits with epoch, seek restarts and the consume iterable continues across sources (stale buffered messages discarded), `stop()`/close delete the ordered consumer, release write
+- [x] T133 `errors.ts`/`index.ts`: `AlreadyInUseError`; remove `CASConflictError`, `AsyncCommitInFlightError`; `types.ts` `inactiveThresholdMs`
+- [x] T134 Tests: same scenario set as Go (crash recovery with 2s threshold)
+
+### Rust (`offset-consumer-rust/`)
+
+- [x] T140 Upgrade to async-nats 0.51 (`OrderedConfig { name, ..Default::default() }`); add `nuid`, `hostname`
+- [x] T141 `kv.rs`: `OffsetEntry` with ownership fields, `read_entry` (non-Put = absent), `claim_entry` (`AlreadyExists`/`WrongLastRevision` → conflict); remove `kv_update`
+- [x] T142 `consumer.rs`: claim flow (grace = fixed 30s), `name: Some(owner-gN)`, consumer name tracked from `cached_info()`/`msg.info().consumer`, chained plain-put writes with epoch, seek restarts with the stored handler, `stop_source` awaits the task then deletes the consumer, release write; `errors.rs` `AlreadyInUse`
+- [x] T143 Tests: same scenario set as Go (crash recovery runs the owner on its own runtime and drops it; ~31s)
+
+### Removal, hygiene, docs
+
+- [x] T150 `git rm -r offset-consumer-dotnet`; delete `contracts/dotnet-api.md`; explain the gap in `README.md`
+- [x] T151 Add `/.gitignore` (IDE, Java build, node_modules/dist, Rust target)
+- [x] T153 Create the bucket with a 10-minute delete-marker TTL in Java (`limitMarker`), JS (`markerTTL`) and Rust (`limit_markers`), matching Go; assert the backing stream config in each suite
+- [x] T154 Benchmark (`bench/`, `BENCHMARK.md`, results in README) and the Close-with-backlog fix: track the highest requested commit, abandon leftovers after the bounded wait, persist it in the release write; regression test per port
+- [x] T152 Add `/README.md`; revise `offset-consumer-spec.md` (1.1), `spec.md`, `data-model.md`, `plan.md`, `research.md`, `quickstart.md`, contracts (Go/Java/JS, new Rust), `checklists/requirements.md`, `CLAUDE.md`
+
